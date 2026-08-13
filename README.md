@@ -21,6 +21,13 @@
 
 ---
 
+> **DadeCore fork notice**
+>
+> This repository is DadeCore's maintained fork of [Gentleman-Programming/engram](https://github.com/Gentleman-Programming/engram), the original upstream project. It is not a temporary mirror — `jcd3dr/engram` is the DadeCore-owned codebase going forward, extended with a network-accessible Remote MCP transport (Streamable HTTP) and DadeCore's private-MCP authentication standard so Engram's persistent memory can be used as a Remote MCP connector from Claude and ChatGPT, deployed via Coolify.
+>
+> All credit for the original design and implementation goes to [Gentleman-Programming](https://github.com/Gentleman-Programming) and its contributors. DadeCore-specific changes are additive: the existing stdio MCP transport, tool behavior, and SQLite/FTS5 memory core are preserved unmodified.
+
+
 > **engram** `/ˈen.ɡræm/` — _neuroscience_: the physical trace of a memory in the brain.
 
 Your AI coding agent forgets everything when the session ends. Engram gives it a brain.
