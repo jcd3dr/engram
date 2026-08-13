@@ -627,7 +627,11 @@ func main() {
 	case "serve":
 		cmdServe(cfg)
 	case "mcp":
-		cmdMCP(cfg)
+		if mcpTransportIsHTTP(os.Args[2:]) {
+			cmdMCPHTTP(cfg)
+		} else {
+			cmdMCP(cfg)
+		}
 	case "tui":
 		cmdTUI(cfg)
 	case "search":
