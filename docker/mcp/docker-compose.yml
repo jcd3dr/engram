@@ -1,0 +1,37 @@
+version: "3.8"
+
+# Coolify deployment for the Engram Remote MCP transport.
+# All secrets are injected via Coolify's environment-variable UI — none are
+# defined with values here. See docs/REMOTE-MCP.md for the full var reference.
+services:
+  engram-mcp:
+    build:
+      context: ../..
+      dockerfile: docker/mcp/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Required — set real values only in Coolify's env var UI, never here.
+      ENGRAM_OWNER_KEY: "${ENGRAM_OWNER_KEY}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+      ENGRAM_PUBLIC_URL: "${ENGRAM_PUBLIC_URL}"
+      ENGRAM_PROJECT: "${ENGRAM_PROJECT:-dadecore-standards}"
+      # Optional
+      MCP_BEARER_TOKEN: "${MCP_BEARER_TOKEN:-}"
+      ENGRAM_HTTP_ADDR: "0.0.0.0:8080"
+      # Persistent data dir inside the container (matches Dockerfile's HOME).
+      ENGRAM_DATA_DIR: "/home/engram/.engram"
+    volumes:
+      - engram_mcp_data:/home/engram/.engram
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    stop_grace_period: 15s
+
+volumes:
+  engram_mcp_data:
+    driver: local
