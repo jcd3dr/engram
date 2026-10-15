@@ -41,6 +41,11 @@ type MCPConfig struct {
 	// auto-resolution; per-call project arguments remain separately validated.
 	DefaultProject string
 
+	// RequireExplicitProject is set by the remote HTTP transport. Engram is
+	// multi-project: project-scoped tools must receive the project argument,
+	// and mem_current_project must not report a process-level or cwd project.
+	RequireExplicitProject bool
+
 	// BM25Floor overrides the default BM25 score floor used by FindCandidates
 	// during conflict candidate detection (REQ-001). The floor is the minimum
 	// acceptable BM25 rank (negative; closer to 0 = better match). Candidates
@@ -236,11 +241,17 @@ func NewServerWithConfig(s *store.Store, cfg MCPConfig, allowlist map[string]boo
 }
 
 func newServerWithActivity(s *store.Store, cfg MCPConfig, allowlist map[string]bool, activity *SessionActivity) *server.MCPServer {
+	opts := []server.ServerOption{
+		server.WithToolCapabilities(true),
+		server.WithInstructions(serverInstructions),
+	}
+	if cfg.RequireExplicitProject {
+		opts = append(opts, server.WithToolHandlerMiddleware(requireExplicitProjectMiddleware))
+	}
 	srv := server.NewMCPServer(
 		"engram",
 		"0.1.0",
-		server.WithToolCapabilities(true),
-		server.WithInstructions(serverInstructions),
+		opts...,
 	)
 
 	registerTools(srv, s, cfg, allowlist, activity)
@@ -942,6 +953,9 @@ ERROR: Returns IsError=true if IDs are unknown, relation is invalid, or cross-pr
 // detection info is available (REQ-313).
 func handleCurrentProject(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if cfg.RequireExplicitProject {
+			return mcp.NewToolResultText(`{"project":"","project_source":"explicit_required","note":"Remote Engram server: pass the project argument explicitly on every mem_* call."}`), nil
+		}
 		cwd, _ := os.Getwd()
 		res := projectpkg.DetectProjectFull(cwd)
 		if processRes, ok := processProjectResult(cfg.DefaultProject); ok {

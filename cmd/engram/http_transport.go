@@ -116,7 +116,7 @@ func cmdMCPHTTP(cfg store.Config) {
 	}
 	defer stopAutosync()
 
-	mcpCfg := mcp.MCPConfig{DefaultProject: projectOverride}
+	mcpCfg := mcp.MCPConfig{DefaultProject: projectOverride, RequireExplicitProject: true}
 	allowlist := resolveMCPTools(toolsFilter)
 	mcpSrv := newMCPServerWithConfig(s, mcpCfg, allowlist)
 
