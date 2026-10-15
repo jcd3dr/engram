@@ -160,3 +160,36 @@ type StaleMCPCommand struct {
 func StaleMCPCommands() ([]StaleMCPCommand, error) {
 	return []StaleMCPCommand{}, nil
 }
+
+func parseClaudeCodePluginVersion(version string) ([3]int, bool, bool) {
+	var values [3]int
+	if version == "" || version != strings.TrimSpace(version) {
+		return values, false, false
+	}
+	version, build, hasBuild := strings.Cut(version, "+")
+	if hasBuild && !validSemverIdentifiers(build, false) {
+		return values, false, false
+	}
+	if strings.Contains(build, "+") {
+		return values, false, false
+	}
+	core, prerelease, hasPrerelease := strings.Cut(version, "-")
+	if hasPrerelease && !validSemverIdentifiers(prerelease, true) {
+		return values, false, false
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return values, false, false
+	}
+	for i, part := range parts {
+		if !validSemverNumber(part) {
+			return values, false, false
+		}
+		value, err := strconv.Atoi(part)
+		if err != nil || value < 0 {
+			return values, false, false
+		}
+		values[i] = value
+	}
+	return values, hasPrerelease, true
+}
