@@ -63,10 +63,12 @@ func TestModulePathMatchesReleaseMajorVersion(t *testing.T) {
 		t.Fatalf("go.mod module line = %q, want %q", firstLine, want)
 	}
 
+	// This fork is distributed from its own GitHub Releases. Its module path is
+	// the upstream one, so `go install` would build upstream, not this fork.
 	install := "go install " + modulePath + "/cmd/engram@latest"
 	installation := releaseConfigFile(t, filepath.Join(root, "docs", "INSTALLATION.md"))
-	if strings.Count(installation, install) < 2 {
-		t.Fatalf("docs/INSTALLATION.md must document %q for both Windows and macOS/Linux", install)
+	if strings.Contains(installation, install) {
+		t.Fatalf("docs/INSTALLATION.md must not document %q: it installs upstream, not this fork", install)
 	}
 }
 

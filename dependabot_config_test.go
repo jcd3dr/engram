@@ -26,7 +26,7 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     reviewers:
-      - "Gentleman-Programming"
+      - "jcd3dr"
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
@@ -42,7 +42,7 @@ updates:
     commit-message:
       prefix: "chore(ci)"
     reviewers:
-      - "Gentleman-Programming"
+      - "jcd3dr"
 
   # Docker image dependencies
   - package-ecosystem: "docker"
@@ -58,7 +58,7 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     reviewers:
-      - "Gentleman-Programming"
+      - "jcd3dr"
 `
 
 const dependabotObsidianPolicy = `updates:

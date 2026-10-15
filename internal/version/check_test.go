@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -274,11 +273,11 @@ func TestUpdateInstructions(t *testing.T) {
 	if msg == "" {
 		t.Fatal("expected non-empty update instructions")
 	}
-	if runtime.GOOS != "darwin" && !strings.Contains(msg, "github.com/Gentleman-Programming/engram/v3/cmd/engram@latest") {
-		t.Fatalf("update instructions = %q, want v3 Go install command", msg)
-	}
-	if runtime.GOOS != "linux" && !strings.Contains(msg, "https://github.com/jcd3dr/engram/releases/latest") {
+	if !strings.Contains(msg, "https://github.com/jcd3dr/engram/releases/latest") {
 		t.Fatalf("update instructions = %q, want canonical GitHub Releases URL", msg)
+	}
+	if strings.Contains(msg, "Gentleman-Programming") || strings.Contains(msg, "brew") {
+		t.Fatalf("update instructions = %q must not point at the upstream tap or module", msg)
 	}
 }
 

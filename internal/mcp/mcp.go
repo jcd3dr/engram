@@ -405,7 +405,6 @@ func buildServerInstructions(allowlist map[string]bool) string {
 		b.WriteString("\n\n")
 	}
 
-	b.WriteString("PROJECT RULE: Engram stores memory for many projects. Pass the project argument explicitly on EVERY mem_* call (mem_save, mem_search, mem_context, mem_session_summary, mem_save_prompt, mem_timeline, mem_stats, mem_review, mem_doctor), using the name of the project the work belongs to (usually the repository name). Do not rely on a default project: this server has none, and a call without project can fail or land in the wrong project.\n\n")
 	if shouldRegister("mem_save", allowlist) {
 		b.WriteString("PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.\n\n")
 	}
