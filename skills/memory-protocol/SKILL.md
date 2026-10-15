@@ -11,6 +11,12 @@ metadata:
 
 Engram is a remote MCP server (connector "engram") that stores memory for many projects. It is shared by every client: Claude Code, claude.ai, ChatGPT.
 
+## Delivery
+
+Memory operations are internal bookkeeping, never the user-facing answer.
+Complete required memory work before composing the completed-task reply; then send the complete answer as the final message of the turn with no later tool calls.
+If memory work fails or needs follow-up, still send the answer.
+
 ## Project rule (mandatory)
 
 Pass the `project` argument explicitly on EVERY mem_* call. The server has no default project. Use the name of the repository or project the work belongs to, in lowercase. Never omit it and never reuse the project of a different task.

@@ -2310,3 +2310,9 @@ COMMIT;
 - [Plugins](docs/PLUGINS.md) — what the OpenCode and Claude Code plugins add beyond bare MCP
 - [Obsidian Brain](docs/beta/obsidian-brain.md) — visualize memories as a knowledge graph (beta)
 - [Contributing](CONTRIBUTING.md) — how to contribute
+
+## Delivery
+
+Memory operations are internal bookkeeping, never the user-facing answer.
+Complete required memory work before composing the completed-task reply; then send the complete answer as the final message of the turn with no later tool calls.
+If memory work fails or needs follow-up, still send the answer.

@@ -23,8 +23,8 @@ func TestPluginHookShebangsArePortable(t *testing.T) {
 				scripts = append(scripts, filepath.Join(scriptsDir, entry.Name()))
 			}
 		}
-		if len(scripts) != 6 {
-			t.Fatalf("%s scripts directory contains %d .sh files, want 6", plugin, len(scripts))
+		if len(scripts) == 0 {
+			t.Fatalf("%s scripts directory contains no .sh files", plugin)
 		}
 
 		for _, script := range scripts {

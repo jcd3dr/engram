@@ -25,5 +25,11 @@ On the first message that references the project, a feature, or a past problem, 
 
 ### Close the session
 Before saying the work is done, call mem_session_summary with: Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
+
+## Delivery
+
+Memory operations are internal bookkeeping, never the user-facing answer.
+Complete required memory work before composing the completed-task reply; then send the complete answer as the final message of the turn with no later tool calls.
+If memory work fails or needs follow-up, still send the answer.
 PROTOCOL
 exit 0
