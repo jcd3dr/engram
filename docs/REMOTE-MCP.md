@@ -80,5 +80,5 @@ Every client connects to the same endpoint. The plugins only add the protocol, t
 | Claude Code | `/plugin marketplace add jcd3dr/engram`, then `/plugin install engram@engram` |
 | Codex | `codex plugin marketplace add jcd3dr/engram --ref main`, then `codex plugin add engram@engram` |
 | OpenCode | Remote entry in `opencode.json` plus `plugin/opencode/engram.ts` (see [PLUGINS.md](PLUGINS.md#opencode-plugin)) |
-| Pi | `pi install npm:gentle-engram@0.1.8`, then `pi-engram init` |
+| Pi | `pi install git:github.com/jcd3dr/engram`, then `pi-engram init` |
 | claude.ai, ChatGPT | Add the connector URL `https://engram-mcp.jcdcruz.com/mcp` in the client settings, then add `skills/memory-protocol/SKILL.md` as a custom skill. These clients cannot run local hooks, so the skill carries the protocol. |

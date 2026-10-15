@@ -8,7 +8,7 @@ no local database.
 ## Install
 
 ```bash
-pi install npm:gentle-engram@0.1.8
+pi install git:github.com/jcd3dr/engram
 pi-engram init
 ```
 

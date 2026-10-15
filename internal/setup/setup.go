@@ -8,7 +8,7 @@
 //     absolute binary path so the subprocess never needs PATH resolution.
 //   - Gemini CLI: injects MCP registration in ~/.gemini/settings.json
 //   - Codex: injects MCP registration in ~/.codex/config.toml
-//   - Pi: installs gentle-engram/pi-mcp-adapter packages and writes Pi MCP config
+//   - Pi: installs the jcd3dr/engram git package and pi-mcp-adapter, then writes Pi MCP config
 package setup
 
 import (
@@ -81,7 +81,7 @@ const codexMarketplace = "jcd3dr/engram"
 
 const openCodeSubagentStatuslinePlugin = "opencode-subagent-statusline"
 
-const piGentleEngramPackage = "npm:gentle-engram@0.1.8"
+const piGentleEngramPackage = "git:github.com/jcd3dr/engram"
 const piMCPAdapterPackage = "npm:pi-mcp-adapter"
 
 // claudeCodeMCPTools are the MCP tool permission names for the agent profile

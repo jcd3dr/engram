@@ -444,7 +444,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if result.Agent != "pi" || result.Destination != agentDir || result.Files != 2 {
 		t.Fatalf("unexpected install result: %#v", result)
 	}
-	wantCommands := []string{"pi install npm:gentle-engram@0.1.8", "pi install npm:pi-mcp-adapter"}
+	wantCommands := []string{"pi install git:github.com/jcd3dr/engram", "pi install npm:pi-mcp-adapter"}
 	if !reflect.DeepEqual(commands, wantCommands) {
 		t.Fatalf("unexpected pi install commands: got %#v want %#v", commands, wantCommands)
 	}
@@ -459,7 +459,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if err := json.Unmarshal(settingsRaw, &settings); err != nil {
 		t.Fatalf("parse settings: %v", err)
 	}
-	for _, pkg := range []string{"npm:gentle-engram@0.1.8", "npm:pi-mcp-adapter"} {
+	for _, pkg := range []string{"git:github.com/jcd3dr/engram", "npm:pi-mcp-adapter"} {
 		if !slices.Contains(settings.Packages, pkg) {
 			t.Fatalf("expected settings packages to include %q, got %#v", pkg, settings.Packages)
 		}
@@ -527,7 +527,7 @@ func TestInstallPiPreservesExistingEngramMCPServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read settings after install: %v", err)
 	}
-	if !strings.Contains(string(settingsRaw), "npm:existing") || !strings.Contains(string(settingsRaw), "npm:gentle-engram@0.1.8") || !strings.Contains(string(settingsRaw), "npm:pi-mcp-adapter") {
+	if !strings.Contains(string(settingsRaw), "npm:existing") || !strings.Contains(string(settingsRaw), "git:github.com/jcd3dr/engram") || !strings.Contains(string(settingsRaw), "npm:pi-mcp-adapter") {
 		t.Fatalf("expected settings packages to be preserved and extended, got %s", settingsRaw)
 	}
 }
@@ -538,7 +538,7 @@ func TestInstallPiCommandFailure(t *testing.T) {
 		return []byte("boom"), errors.New("exit 1")
 	}
 	_, err := Install("pi")
-	if err == nil || !strings.Contains(err.Error(), "install npm:gentle-engram@0.1.8") {
+	if err == nil || !strings.Contains(err.Error(), "install git:github.com/jcd3dr/engram") {
 		t.Fatalf("expected pi install error, got %v", err)
 	}
 }

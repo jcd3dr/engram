@@ -22,7 +22,7 @@ func agentAdapters() []agentAdapter {
 		},
 		{
 			slug:        "pi",
-			description: "Pi — gentle-engram package plus pi-mcp-adapter MCP tools",
+			description: "Pi — engram package from jcd3dr/engram plus pi-mcp-adapter MCP tools",
 			custom:      installPi,
 			installDir:  piAgentDir,
 			postInstall: []string{

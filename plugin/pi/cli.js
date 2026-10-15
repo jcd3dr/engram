@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-const PACKAGE_NAME = "npm:gentle-engram@0.1.8";
+const PACKAGE_NAME = "git:github.com/jcd3dr/engram";
 const MCP_ADAPTER_PACKAGE = "npm:pi-mcp-adapter";
 const ENGRAM_MCP_URL = process.env.ENGRAM_MCP_URL?.trim() || "https://engram-mcp.jcdcruz.com/mcp";
 const HELP = `pi-engram
@@ -13,7 +13,7 @@ Usage:
 
 Writes Pi's Engram MCP entry (the hosted Engram server) into the Pi agent dir and
 ensures pi-mcp-adapter is declared in settings.json. The Pi extension itself is
-loaded by installing the package with: pi install npm:gentle-engram@0.1.8
+loaded by installing the package with: pi install git:github.com/jcd3dr/engram
 
 Environment:
   ENGRAM_MCP_URL  Engram MCP endpoint to write (default: https://engram-mcp.jcdcruz.com/mcp)

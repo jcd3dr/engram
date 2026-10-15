@@ -1,0 +1,14 @@
+{
+  "name": "engram",
+  "version": "0.2.0",
+  "description": "Engram — persistent memory for AI coding agents (hosted MCP server, plugins for each client)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jcd3dr/engram.git"
+  },
+  "homepage": "https://github.com/jcd3dr/engram",
+  "pi": {
+    "extensions": ["./plugin/pi/index.ts"]
+  }
+}
