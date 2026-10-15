@@ -30,9 +30,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/mcp"
-	"github.com/Gentleman-Programming/engram/internal/remoteauth"
-	"github.com/Gentleman-Programming/engram/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/mcp"
+	"github.com/Gentleman-Programming/engram/v3/internal/remoteauth"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 

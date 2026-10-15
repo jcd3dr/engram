@@ -23,6 +23,39 @@ Breaking changes are always marked with a `type:breaking-change` label and docum
 
 <!-- Changes that are merged but not yet released are tracked here until the next tag. -->
 
+### Core release recovery (Engram 3.3.2)
+
+- **chore(deps):** classify the existing `modernc.org/libc v1.70.0` requirement as direct so the unchanged release module-tidy gate passes; dependency versions and runtime behavior are unchanged.
+- The Engram `v3.3.1` binary release stopped at that gate before GoReleaser. Preserve its existing tag and Cloud image; `gentle-engram@0.4.1` is already published and is not republished by this recovery.
+
+### Patch release preparation (Engram 3.3.1 / gentle-engram 0.4.1)
+
+- **chore(release):** align the Pi package and core installer on `gentle-engram@0.4.1`, including idempotent upgrades from `0.4.0` without changing unrelated Pi settings or MCP configuration.
+- **fix(pi):** include the already-merged correction reserving session summaries for explicit closure (#1771) in the new Pi package artifact.
+
+### Memory core
+
+- **fix(claude):** bind the PreToolUse write gate to the session's registered owner project instead of re-deriving it from the hook cwd (#1717). Writes from a registered session now succeed wherever the shell is — subfolders, sibling or cloned repositories, removed worktrees, and ambiguous directories no longer deny the gate. The cwd names the project only on first registration. Denials now name their actual cause (`already ended`, `session_project_conflict` with owner and requested projects, project-resolution failures with the server's reason) instead of the single generic "registration could not be confirmed" message shared with #1624.
+
+- **feat(mcp):** add an optional validated `project` argument to `mem_get_observation` for response context. Observation lookup remains ID-based and is not filtered by project ownership.
+- **fix(store):** upgrade the embedded SQLite runtime to 3.51.3, which includes SQLite's upstream WAL-reset integrity fix. Engram's WAL and network-filesystem policies are unchanged.
+
+- **fix(project):** make project-scoped reads consistent across CLI and local HTTP. Omitted selectors now resolve the canonical current project; use `--all` or `all_projects=true` for an intentional global read. Search, timeline, stats, export, Obsidian export, conflict inspection, recent lists, review, prompts, and sync status now validate explicit selectors through the shared resolver. Sync status rejects `all_projects=true` because it has no aggregate provider. This is a compatibility change for callers that relied on omitted reads being global.
+- **fix(project):** scan child repositories until EOF, the 200ms deadline, or the second repository. Large noisy directories can no longer auto-promote an early repository while a later repository makes the cwd ambiguous.
+- **fix(store):** establish project ownership forward on legacy sessions instead of rejecting their writes. A database upgraded from the schema where `sessions.project` was nullable still holds sessions that identify no project; those sessions now adopt the project of the write landing on them, in the same transaction and journaled like any other ownership move, so the record and its session agree rather than the write failing permanently. Adoption is refused only when the unowned session already parents a record owned by a different project, which would split that record from its session. Both ownership errors answer `409` with a `code` and a `remedy` naming the exact repair.
+- **feat(cli):** add `engram projects rescue-ownership --project <name> [--session <id>] [--observation <id>] [--prompt <id>]`. It performs the same ownership repair as `POST /projects/rescue-ownership` against the local store, so recovery no longer requires `ENGRAM_HTTP_TOKEN` to be configured.
+- **fix(store):** resolve the whole rescue plan before mutating anything. The session pass previously claimed dependent parent sessions before any record's ownership was examined, so an unowned session parenting a record owned by another project was moved while the record was left behind — a split in the mirror direction of the case the rescue guards. Sessions and records are now decided together and applied afterwards.
+- **fix(server):** report rescue outcomes unambiguously. The response carries `complete` and a `blocked` list naming every item left behind with its reason, and `status` is `partially_rescued` rather than `rescued` when anything was; a partial outcome is no longer indistinguishable from a clean one.
+- **fix(store):** read `sessions.project` as nullable in `GetSession`, so a legacy NULL row no longer fails every caller that inspects the session with an opaque scan error.
+- **fix(doctor):** read `sessions.project` through `ifnull()` in the diagnostic queries, so `engram doctor` no longer dies with `converting NULL to string is unsupported` on a database upgraded from the schema where the column was nullable. That population is precisely the one the `project_ownership_required` remedy sends to doctor, and it previously got no report at all.
+- **fix(doctor):** report grouped `orphaned_observation_session` findings when active or soft-deleted observations reference a missing local session. The diagnostic is report-only because the canonical session cannot be reconstructed automatically; `engram doctor repair` rejects it and creates no backup.
+- **fix(store):** read `sessions.project` through `ifnull()` at every remaining site that scanned it raw. An audit of the whole store found the same crash in `RecentSessions` and `AllSessions` (so a single legacy row denied the user `engram context`, `mem_context`, and the TUI session list), in `Export` (the way data leaves the store before a repair), and in `DeleteSession`, `EndSession`, and the `CreateSession` readback (so a legacy session could not be deleted, ended, or re-registered). `sessions.project` is the only column in the schema that is nullable in practice but declared `NOT NULL`: the table is only ever created with `CREATE TABLE IF NOT EXISTS`, so the declaration never reaches rows written before it, and no migration rewrites or backfills the column.
+- **feat(doctor):** add the `unowned_session_project` check. It reports every session that identifies no project — NULL or blank — and carries the exact `engram projects rescue-ownership --project <name> --session <id>` repair, so the legacy ownership state doctor can now read is also surfaced instead of silently passing. The listing is unscoped by design: an unowned session belongs to no project, so `--project` cannot filter it away.
+- **fix(pi):** surface background capture failures on stderr instead of discarding them, so a user whose passive memories stopped being saved gets a signal.
+- **feat(pi):** add `mem_list_projects`, `mem_pin`, and `mem_unpin` Pi-native tools, bringing the plugin to tool parity with the Engram agent MCP profile. `mem_list_projects` enumerates known projects through the new `GET /projects` route; `mem_pin`/`mem_unpin` toggle local observation pin state through the existing pin routes.
+- **fix(store):** reject empty or whitespace-only observation titles consistently on create and update, before any side effect. `engram save` and `mem_save` now refuse a titleless write before opening the store or creating a session, `POST /observations` validates the title before the session lookup so a bad session or project can no longer mask the documented `400`, and `PATCH /observations/{id}` answers `400` rather than `404`. Persisting a titleless observation also enqueues a cloud upsert that the sync validators reject, which blocks every later mutation for the project.
+- **feat(server):** add `GET /projects`, the HTTP view of `mem_list_projects` backed by the same `ListProjectsWithStats` store query as the MCP tool and `engram projects list`, so CLI, MCP, and HTTP clients never diverge. An empty store answers `200` with an empty listing.
+
 ### Cloud sync
 
 - **fix(cloud):** make chunk and mutation push payload limits configurable with `ENGRAM_CLOUD_MAX_PUSH_BYTES` while preserving the 8 MiB default.
@@ -40,6 +73,8 @@ Breaking changes are always marked with a `type:breaking-change` label and docum
 
 ### Pi package (`pi-engram`)
 
+- **fix(pi):** stop adding `pi-mcp-adapter` in `engram setup pi` and `pi-engram init`. Pi 0.99.0 and later ship built-in MCP that reads `mcp.json`, and an installed `pi-mcp-adapter` replaces it, so setup no longer runs `pi install npm:pi-mcp-adapter` or declares it in `settings.json`; an existing adapter entry is left untouched. The package also drops its optional `pi-mcp-adapter` peer dependency.
+- **fix(plugin):** declare `@earendil-works/pi-tui` as an optional peer dependency instead of a hard `^0.74.0` dependency. The extension only renders `Text` from it while running inside pi, which always ships its own copy; the hard dependency gave npm a legal reason to hoist a `0.74.x` over the `^0.84.x` range declared by the installed pi-coding-agent and crash every pi child spawn with `SyntaxError: ... does not provide an export named 'TuiMainScreen'`. With the peer declaration the host's copy wins, npm never auto-installs a second pi-tui, and the range `>=0.74.0` accepts both pi-tui lines the plugin is verified against ([#853](https://github.com/Gentleman-Programming/engram/issues/853)).
 - **fix(plugin):** allow `mem_session_summary` to accept an explicit `project` fallback when automatic project detection is unavailable.
 - **fix(plugin):** fall back to local `.engram/config.json` and surface a clearer version-mismatch diagnostic when the running Engram server lacks `/project/current`.
 - **feat(plugin):** add `gentle-engram` package for Pi marketplace installs, with HTTP event capture, Memory Protocol prompt injection, safe `engram mcp` launcher config, and `pi-engram init` setup helper.
@@ -74,20 +109,24 @@ Background mutation-based replication for `engram serve` and `engram mcp`:
 - **feat(autosync):** `StopForUpgrade` / `ResumeAfterUpgrade` for upgrade-window pause without releasing the sync lease
 - **fix(autosync):** SIGTERM cancels context → `releaseLease()` deferred in `Run()` for graceful shutdown
 
-### BREAKING CHANGE: MCP write tools no longer accept a `project` field
+### MCP write-tool project selection (historical correction)
 
-The `project` argument has been removed from the JSON schemas of 7 MCP write tools:
-`mem_save`, `mem_save_prompt`, `mem_session_start`, `mem_session_end`, `mem_session_summary`, `mem_capture_passive`, `mem_update`.
+An earlier version of this changelog incorrectly stated that MCP write tools
+removed or discarded the `project` field. That statement is not the current
+contract. Current-project writes may use an explicit project override where the
+tool schema supports it; `mem_session_end` and `mem_capture_passive` continue
+to resolve their project from the current process context.
 
-**Before:** agents could pass `project: "my-project"` to write tools.
-**After:** the project is auto-detected from the server's working directory (cwd). Any `project` argument sent by the LLM is silently discarded.
+**Current behavior:** explicit project values are resolved and validated by the
+server for the supported write tools. When no override is supplied, Engram
+uses its normal process override and cwd-detection precedence.
 
 **Migration:**
 
-- Remove `project` from write tool calls in your agent's memory protocol.
-- Use `mem_current_project` (new tool) to inspect which project Engram will use before writing.
+- When no explicit project override is supplied, use `mem_current_project` to inspect which project Engram will use before writing; it reports cwd-based detection.
+- An explicit project override takes precedence over process and cwd detection. Invalid or unbacked explicit names fail without fallback.
 - If the cwd is ambiguous (multiple git repos), Engram returns a structured error with `available_projects`. Navigate to one of the repos before writing.
-- Read tools (`mem_search`, `mem_context`, `mem_timeline`, `mem_get_observation`, `mem_stats`) still accept an optional `project` override — validated against the store.
+- Read tools (`mem_search`, `mem_context`, `mem_timeline`, `mem_stats`) accept an optional `project` override validated against the store. `mem_get_observation` also accepts one for response context only; lookup remains by ID and is not filtered by ownership.
 
 ### New tool: `mem_current_project`
 

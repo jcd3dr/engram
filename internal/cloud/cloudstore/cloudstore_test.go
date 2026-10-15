@@ -3,19 +3,21 @@ package cloudstore
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud"
-	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
-	"github.com/Gentleman-Programming/engram/internal/store"
-	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/v3/internal/sync"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -197,6 +199,86 @@ func TestMaterializedMutationBatchChunksKeepProjectsSeparate(t *testing.T) {
 	}
 }
 
+// Direct uploads deliberately retain payload IDs; this parity covers only
+// canonically valid inputs and does not broaden direct-upload normalization.
+func TestMutationOnlyChunkAndMutationPushMaterializeEquivalentEntries(t *testing.T) {
+	project := "proj-mutation-parity"
+	projectValue := project
+	marshal := func(value any) json.RawMessage {
+		t.Helper()
+		payload, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("marshal mutation payload: %v", err)
+		}
+		return payload
+	}
+	batch := []MutationEntry{
+		{Project: project, Entity: store.SyncEntitySession, EntityKey: "sess-1", Op: store.SyncOpUpsert, Payload: marshal(store.Session{ID: "sess-1", Project: project, Directory: "/work/parity", StartedAt: "2026-05-04T09:00:00Z"})},
+		{Project: project, Entity: store.SyncEntityObservation, EntityKey: "obs-1", Op: store.SyncOpUpsert, Payload: marshal(store.Observation{SyncID: "obs-1", SessionID: "sess-1", Project: &projectValue, Type: "decision", Title: "Parity", Content: "same materialization", Scope: "project", CreatedAt: "2026-05-04T09:01:00Z"})},
+		{Project: project, Entity: store.SyncEntityPrompt, EntityKey: "prompt-1", Op: store.SyncOpUpsert, Payload: marshal(store.Prompt{SyncID: "prompt-1", SessionID: "sess-1", Project: project, Content: "parity prompt", CreatedAt: "2026-05-04T09:02:00Z"})},
+	}
+	directChunk := engramsync.ChunkData{Mutations: make([]store.SyncMutation, 0, len(batch))}
+	for _, entry := range batch {
+		directChunk.Mutations = append(directChunk.Mutations, store.SyncMutation{Project: entry.Project, Entity: entry.Entity, EntityKey: entry.EntityKey, Op: entry.Op, Payload: string(entry.Payload)})
+	}
+	direct, err := materializedChunkMutations(project, directChunk)
+	if err != nil {
+		t.Fatalf("materializedChunkMutations direct: %v", err)
+	}
+
+	payload, _, err := materializedMutationBatchChunk(batch)
+	if err != nil {
+		t.Fatalf("materializedMutationBatchChunk: %v", err)
+	}
+	pushed, err := materializedChunkMutations(project, parseMustChunk(t, payload))
+	if err != nil {
+		t.Fatalf("materializedChunkMutations mutation push: %v", err)
+	}
+	if len(direct) != len(pushed) {
+		t.Fatalf("expected %d parity entries, got %d", len(direct), len(pushed))
+	}
+	for i := range direct {
+		if direct[i].Project != pushed[i].Project || direct[i].Entity != pushed[i].Entity || direct[i].EntityKey != pushed[i].EntityKey || direct[i].Op != pushed[i].Op || string(normalizeJSON(direct[i].Payload)) != string(normalizeJSON(pushed[i].Payload)) {
+			t.Fatalf("entry %d differs between direct upload and mutation push\ndirect=%+v\npushed=%+v", i, direct[i], pushed[i])
+		}
+	}
+}
+
+func TestMaterializedChunkMutationsSkipsUnsupportedTypedOperations(t *testing.T) {
+	entries, err := materializedChunkMutations("proj-unsupported-op", engramsync.ChunkData{Mutations: []store.SyncMutation{
+		{Entity: store.SyncEntitySession, EntityKey: "sess-1", Op: "replace", Payload: `{"id":"sess-1"}`},
+		{Entity: store.SyncEntityObservation, EntityKey: "obs-1", Op: "patch", Payload: `{"sync_id":"obs-1"}`},
+		{Entity: store.SyncEntityPrompt, EntityKey: "prompt-1", Op: "merge", Payload: `{"sync_id":"prompt-1"}`},
+		{Entity: store.SyncEntityRelation, EntityKey: "rel-1", Op: "replace", Payload: `{"sync_id":"rel-1","source_id":"obs-a","target_id":"obs-b","relation":"related","judgment_status":"judged","marked_by_actor":"agent-a","marked_by_kind":"agent"}`},
+	}})
+	if err != nil {
+		t.Fatalf("materializedChunkMutations: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Entity != store.SyncEntityRelation || entries[0].Op != "replace" {
+		t.Fatalf("expected only unchanged relation materialization, got %+v", entries)
+	}
+}
+
+func TestMaterializedChunkMutationsRejectsInvalidTypedUpserts(t *testing.T) {
+	tests := []struct{ name, entity, payload string }{
+		{"session/malformed", store.SyncEntitySession, `{`},
+		{"observation/malformed", store.SyncEntityObservation, `{`},
+		{"prompt/malformed", store.SyncEntityPrompt, `{`},
+		{"null", store.SyncEntitySession, `null`},
+		{"session/mismatch", store.SyncEntitySession, `{"id":"payload-id"}`},
+		{"observation/mismatch", store.SyncEntityObservation, `{"sync_id":"payload-id"}`},
+		{"prompt/mismatch", store.SyncEntityPrompt, `{"sync_id":"payload-id"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := materializeChunkMutation("project", store.SyncMutation{Entity: test.entity, EntityKey: "entity-key", Op: store.SyncOpUpsert, Payload: test.payload})
+			if err == nil {
+				t.Fatalf("expected invalid %s upsert to fail", test.entity)
+			}
+		})
+	}
+}
+
 func TestMutationEntrySignatureMatchesCanonicalChunkMutation(t *testing.T) {
 	entry := MutationEntry{
 		Project:   "proj-signature",
@@ -328,20 +410,21 @@ func TestCollectSessionIDsIncludesChunkSessionsAndMutationSessions(t *testing.T)
 	sessionIDs := collectSessionIDsFromPayload([]byte(`{
 		"sessions":[{"id":"s-1"}],
 		"mutations":[
-			{"entity":"session","op":"upsert","payload":"{\"id\":\"s-2\",\"directory\":\"/tmp/s-2\"}"},
-			{"entity":"session","op":"upsert","payload":"\"{\\\"id\\\":\\\"s-3\\\",\\\"directory\\\":\\\"/tmp/s-3\\\"}\""},
-			{"entity":"observation","op":"upsert","payload":"{\"session_id\":\"s-1\"}"}
+			{"entity":"session","entity_key":"s-1","op":"upsert","payload":"{\"id\":\"s-1\",\"directory\":\"/tmp/s-1\"}"},
+			{"entity":"session","entity_key":"s-2","op":"upsert","payload":"{\"id\":\"s-2\",\"directory\":\"/tmp/s-2\"}"},
+			{"entity":"session","entity_key":"s-3","op":"upsert","payload":"\"{\\\"id\\\":\\\"s-3\\\",\\\"directory\\\":\\\"/tmp/s-3\\\"}\""},
+			{"entity":"session","entity_key":"s-4","op":"upsert","payload":"{\"directory\":\"/tmp/s-4\"}"},
+			{"entity":"observation","entity_key":"obs-1","op":"upsert","payload":"{\"session_id\":\"s-1\"}"}
 		]
 	}`))
 
-	if _, ok := sessionIDs["s-1"]; !ok {
-		t.Fatalf("expected session id from chunk sessions")
+	if len(sessionIDs) != 4 {
+		t.Fatalf("expected typed and mutation session IDs to dedupe, got %d: %+v", len(sessionIDs), sessionIDs)
 	}
-	if _, ok := sessionIDs["s-2"]; !ok {
-		t.Fatalf("expected session id from mutation payload")
-	}
-	if _, ok := sessionIDs["s-3"]; !ok {
-		t.Fatalf("expected session id from double-encoded mutation payload")
+	for _, sessionID := range []string{"s-1", "s-2", "s-3", "s-4"} {
+		if _, ok := sessionIDs[sessionID]; !ok {
+			t.Fatalf("expected session id %q from chunk session or mutation", sessionID)
+		}
 	}
 }
 
@@ -371,6 +454,22 @@ func TestParseClientCreatedAt(t *testing.T) {
 			t.Fatal("expected parse error for invalid timestamp")
 		}
 	})
+}
+
+func TestReadManifestEmitsOwnershipModeVersion(t *testing.T) {
+	db, err := sql.Open(projectGrantBindingDriverName, "")
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	manifest, err := (&CloudStore{db: db}).ReadManifest(context.Background(), "proj-a")
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if manifest.Version != 2 {
+		t.Fatalf("manifest version = %d, want 2", manifest.Version)
+	}
 }
 
 func TestSortManifestRowsByServerCreatedAtForReplay(t *testing.T) {
@@ -490,7 +589,7 @@ func TestMaterializedChunkMutationsRejectsMissingSyncIDs(t *testing.T) {
 
 func TestMaterializedChunkMutationsCarriesRelationFromChunkMutations(t *testing.T) {
 	project := "proj-materialize-rel"
-	relationPayload := `{"sync_id":"rel-1","source_id":"obs-a","target_id":"obs-b","relation":"related","project":"proj-materialize-rel"}`
+	relationPayload := `{"sync_id":"rel-1","source_id":"obs-a","target_id":"obs-b","relation":"related","judgment_status":"judged","marked_by_actor":"agent-a","marked_by_kind":"agent","project":"proj-materialize-rel"}`
 	chunk := engramsync.ChunkData{
 		Observations: []store.Observation{{SyncID: "obs-a"}, {SyncID: "obs-b"}},
 		Mutations: []store.SyncMutation{
@@ -536,6 +635,258 @@ func TestMaterializedChunkMutationsCarriesRelationFromChunkMutations(t *testing.
 	}
 }
 
+// #837: a prompt is hard-deleted locally, so it cannot ride in chunk.Prompts.
+// Its delete travels only as a chunk.Mutations entry and must still materialize.
+func TestMaterializedChunkMutationsCarriesPromptDeleteFromChunkMutations(t *testing.T) {
+	project := "proj-materialize-prompt-delete"
+	deletePayload := `{"sync_id":"prompt-1","session_id":"s-1","project":"proj-materialize-prompt-delete","deleted":true,"hard_delete":true,"deleted_at":"2026-04-29T10:05:00Z"}`
+	chunk := engramsync.ChunkData{
+		Sessions: []store.Session{{ID: "s-1", Project: project}},
+		Mutations: []store.SyncMutation{
+			{Project: project, Entity: store.SyncEntityPrompt, EntityKey: "prompt-1", Op: store.SyncOpDelete, Payload: deletePayload},
+		},
+	}
+
+	entries, err := materializedChunkMutations(project, chunk)
+	if err != nil {
+		t.Fatalf("materializedChunkMutations: %v", err)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("expected session upsert + prompt delete, got %d: %+v", len(entries), entries)
+	}
+
+	var promptDelete *MutationEntry
+	for i := range entries {
+		if entries[i].Entity == store.SyncEntityPrompt {
+			promptDelete = &entries[i]
+		}
+	}
+	if promptDelete == nil {
+		t.Fatalf("expected prompt delete materialized from chunk.Mutations, got %+v", entries)
+	}
+	if promptDelete.EntityKey != "prompt-1" || promptDelete.Op != store.SyncOpDelete || promptDelete.Project != project {
+		t.Fatalf("unexpected prompt delete entry: %+v", *promptDelete)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(promptDelete.Payload, &payload); err != nil {
+		t.Fatalf("prompt delete payload is not object JSON: %v", err)
+	}
+	if payload["sync_id"] != "prompt-1" {
+		t.Fatalf("prompt delete payload not preserved: %+v", payload)
+	}
+}
+
+// #837: DeleteObservation(id, hardDelete=true) removes the row exactly like
+// DeletePrompt, so its delete can only travel as a chunk.Mutations entry too.
+func TestMaterializedChunkMutationsCarriesObservationHardDeleteFromChunkMutations(t *testing.T) {
+	project := "proj-materialize-obs-hard-delete"
+	deletePayload := `{"sync_id":"obs-1","session_id":"s-1","project":"proj-materialize-obs-hard-delete","deleted":true,"hard_delete":true,"deleted_at":"2026-04-29T10:05:00Z"}`
+	chunk := engramsync.ChunkData{
+		Sessions: []store.Session{{ID: "s-1", Project: project}},
+		Mutations: []store.SyncMutation{
+			{Project: project, Entity: store.SyncEntityObservation, EntityKey: "obs-1", Op: store.SyncOpDelete, Payload: deletePayload},
+		},
+	}
+
+	entries, err := materializedChunkMutations(project, chunk)
+	if err != nil {
+		t.Fatalf("materializedChunkMutations: %v", err)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("expected session upsert + observation delete, got %d: %+v", len(entries), entries)
+	}
+	var observationDelete *MutationEntry
+	for i := range entries {
+		if entries[i].Entity == store.SyncEntityObservation {
+			observationDelete = &entries[i]
+		}
+	}
+	if observationDelete == nil {
+		t.Fatalf("expected observation delete materialized from chunk.Mutations, got %+v", entries)
+	}
+	if observationDelete.EntityKey != "obs-1" || observationDelete.Op != store.SyncOpDelete || observationDelete.Project != project {
+		t.Fatalf("unexpected observation delete entry: %+v", *observationDelete)
+	}
+}
+
+// A soft-deleted observation still rides in chunk.Observations (its row survives
+// with deleted_at set), so it materializes an upsert. The paired delete mutation
+// must materialize after it, otherwise replaying cloud_mutations resurrects it.
+func TestMaterializedChunkMutationsOrdersObservationSoftDeleteAfterTypedUpsert(t *testing.T) {
+	project := "proj-materialize-obs-soft-delete"
+	deletedAt := "2026-04-29T10:05:00Z"
+	chunk := engramsync.ChunkData{
+		Observations: []store.Observation{{SyncID: "obs-1", SessionID: "s-1", DeletedAt: &deletedAt}},
+		Mutations: []store.SyncMutation{
+			{Project: project, Entity: store.SyncEntityObservation, EntityKey: "obs-1", Op: store.SyncOpDelete, Payload: `{"sync_id":"obs-1","session_id":"s-1","deleted":true,"deleted_at":"2026-04-29T10:05:00Z"}`},
+		},
+	}
+
+	entries, err := materializedChunkMutations(project, chunk)
+	if err != nil {
+		t.Fatalf("materializedChunkMutations: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected typed upsert + delete, got %d: %+v", len(entries), entries)
+	}
+	if entries[0].Op != store.SyncOpUpsert || entries[1].Op != store.SyncOpDelete {
+		t.Fatalf("expected the delete to be materialized last, got %+v", entries)
+	}
+}
+
+// The skip that dropped prompt deletes exists to keep upserts from being
+// materialized twice — once from the typed collection and once from the
+// mirrored chunk.Mutations entry. That invariant must survive the fix.
+func TestMaterializedChunkMutationsMaterializesUpsertsExactlyOnce(t *testing.T) {
+	project := "proj-materialize-no-duplicates"
+	chunk := engramsync.ChunkData{
+		Sessions:     []store.Session{{ID: "s-1", Project: project}},
+		Observations: []store.Observation{{SyncID: "obs-1", SessionID: "s-1"}},
+		Prompts:      []store.Prompt{{SyncID: "prompt-1", SessionID: "s-1", Project: project}},
+		Mutations: []store.SyncMutation{
+			{Project: project, Entity: store.SyncEntitySession, EntityKey: "s-1", Op: store.SyncOpUpsert, Payload: `{"id":"s-1"}`},
+			{Project: project, Entity: store.SyncEntityObservation, EntityKey: "obs-1", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-1"}`},
+			{Project: project, Entity: store.SyncEntityPrompt, EntityKey: "prompt-1", Op: store.SyncOpUpsert, Payload: `{"sync_id":"prompt-1"}`},
+		},
+	}
+
+	entries, err := materializedChunkMutations(project, chunk)
+	if err != nil {
+		t.Fatalf("materializedChunkMutations: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected exactly one entry per typed row, got %d: %+v", len(entries), entries)
+	}
+	seen := make(map[string]int, len(entries))
+	for _, entry := range entries {
+		if entry.Op != store.SyncOpUpsert {
+			t.Fatalf("expected only upserts, got %+v", entry)
+		}
+		seen[entry.Entity+"/"+entry.EntityKey]++
+	}
+	for key, count := range seen {
+		if count != 1 {
+			t.Fatalf("entry %s materialized %d times, want exactly 1", key, count)
+		}
+	}
+}
+
+func TestInsertMutationBatchFailureIdentifiesFailingEntryAndRollsBack(t *testing.T) {
+	resetPartialFailDriver(1) // succeed first INSERT, fail the second
+	db, err := sql.Open("cloudstore-partial-fail-driver", "dsn")
+	if err != nil {
+		t.Fatalf("open partial failure db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	cs := &CloudStore{db: db}
+
+	_, err = cs.InsertMutationBatch(context.Background(), []MutationEntry{
+		{Project: "proj-a", Entity: "custom", EntityKey: "first-entry", Op: "upsert", Payload: json.RawMessage(`{}`)},
+		{Project: "proj-a", Entity: "failing-entity", EntityKey: "failing-key", Op: "upsert", Payload: json.RawMessage(`{}`)},
+	})
+	if err == nil {
+		t.Fatal("expected the second entry to fail")
+	}
+	for _, want := range []string{
+		"batch_index=1",
+		`entity="failing-entity"`,
+		`entity_key="failing-key"`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("InsertMutationBatch error = %q, want %q", err, want)
+		}
+	}
+	if tx := partialFailDriverSingleton.lastTx; tx == nil || !tx.rolledBack || tx.committed {
+		t.Fatalf("expected rollback without commit after second-entry failure, got %+v", tx)
+	}
+
+	cause := errors.New("raw-cause-secret-must-not-appear")
+	entryErr := &MutationBatchEntryError{BatchIndex: 1, Entity: "failing-entity", EntityKey: "failing-key", Err: cause}
+	if strings.Contains(entryErr.Error(), cause.Error()) {
+		t.Fatalf("public mutation batch error exposes wrapped cause: %q", entryErr)
+	}
+	if !errors.Is(entryErr, cause) {
+		t.Fatal("expected wrapped cause to remain discoverable with errors.Is")
+	}
+}
+
+type replayIndexDriver struct {
+	indexErr error
+	inserts  int
+}
+
+type replayIndexConn struct{ state *replayIndexDriver }
+type replayIndexRows struct {
+	payload []byte
+	done    bool
+}
+
+func (d *replayIndexDriver) Open(string) (driver.Conn, error) { return &replayIndexConn{state: d}, nil }
+func (d *replayIndexDriver) Connect(context.Context) (driver.Conn, error) {
+	return d.Open("")
+}
+func (d *replayIndexDriver) Driver() driver.Driver { return d }
+func (c *replayIndexConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("unexpected prepare")
+}
+func (c *replayIndexConn) Close() error { return nil }
+func (c *replayIndexConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("unexpected transaction")
+}
+func (c *replayIndexConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if !strings.Contains(query, "SELECT payload::text FROM cloud_chunks") {
+		return nil, fmt.Errorf("unexpected query: %s", query)
+	}
+	return &replayIndexRows{payload: []byte(`{"sessions":[{"id":"s-1"}]}`)}, nil
+}
+func (c *replayIndexConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	if !strings.Contains(query, "INSERT INTO cloud_project_sessions") {
+		return nil, fmt.Errorf("unexpected exec: %s", query)
+	}
+	c.state.inserts++
+	if c.state.indexErr != nil {
+		return nil, c.state.indexErr
+	}
+	return driver.RowsAffected(0), nil
+}
+func (r *replayIndexRows) Columns() []string { return []string{"payload"} }
+func (r *replayIndexRows) Close() error      { return nil }
+func (r *replayIndexRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = r.payload
+	return nil
+}
+
+func TestWriteChunkReplayIndexFailure(t *testing.T) {
+	cause := errors.New("session index unavailable")
+	for _, tt := range []struct {
+		name     string
+		indexErr error
+	}{
+		{name: "index failure", indexErr: cause},
+		{name: "healthy replay"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			state := &replayIndexDriver{indexErr: tt.indexErr}
+			db := sql.OpenDB(state)
+			t.Cleanup(func() { _ = db.Close() })
+			payload := []byte(`{"sessions":[{"id":"s-1"}]}`)
+			err := (&CloudStore{db: db}).WriteChunk(context.Background(), "project", chunkIDFromPayload(payload), "tester", "", payload)
+			if !errors.Is(err, tt.indexErr) || (tt.indexErr != nil && !strings.Contains(err.Error(), `index session "s-1"`)) {
+				t.Fatalf("replay error = %v, want index error %v", err, tt.indexErr)
+			}
+			if state.inserts != 1 {
+				t.Fatalf("index insert count = %d, want 1", state.inserts)
+			}
+		})
+	}
+}
+
 func TestWriteChunkMaterializesRelationMutationIntoCloudMutations(t *testing.T) {
 	cs := openTestCloudStore(t)
 	project := "test-chunk-relation-" + strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000000000"), ".", "-")
@@ -545,7 +896,7 @@ func TestWriteChunkMaterializesRelationMutationIntoCloudMutations(t *testing.T) 
 			{"sync_id":"obs-b","session_id":"s-1","type":"decision","title":"B","content":"B","scope":"project","created_at":"2026-04-29T10:01:00Z","updated_at":"2026-04-29T10:01:00Z"}
 		],
 		"mutations":[
-			{"entity":"relation","entity_key":"rel-1","op":"upsert","payload":"{\"sync_id\":\"rel-1\",\"source_id\":\"obs-a\",\"target_id\":\"obs-b\",\"relation\":\"related\"}"}
+			{"entity":"relation","entity_key":"rel-1","op":"upsert","payload":"{\"sync_id\":\"rel-1\",\"source_id\":\"obs-a\",\"target_id\":\"obs-b\",\"relation\":\"related\",\"judgment_status\":\"judged\",\"marked_by_actor\":\"agent-a\",\"marked_by_kind\":\"agent\"}"}
 		]
 	}`), project)
 	if err != nil {
@@ -590,6 +941,32 @@ func TestWriteChunkMaterializesRelationMutationIntoCloudMutations(t *testing.T) 
 	}
 	if relCount != 1 {
 		t.Fatalf("expected exactly one relation row after replay, got %d", relCount)
+	}
+}
+
+func TestWriteChunkRejectsIncompleteRelationBeforePersistence(t *testing.T) {
+	cs := openTestCloudStore(t)
+	project := "test-invalid-chunk-relation-" + strings.ReplaceAll(t.Name(), "/", "-")
+	payload := []byte(`{
+		"mutations":[
+			{"entity":"relation","entity_key":"rel-1","op":"upsert","payload":"{\"source_id\":\"obs-a\",\"target_id\":\"obs-b\",\"relation\":\"related\",\"judgment_status\":\"judged\",\"marked_by_actor\":\"agent-a\",\"marked_by_kind\":\"agent\"}"}
+		]
+	}`)
+
+	err := cs.WriteChunk(context.Background(), project, chunkIDFromPayload(payload), "tester", "2026-04-29T10:03:00Z", payload)
+	if err == nil || !strings.Contains(err.Error(), "mutations[0].payload.sync_id is required") {
+		t.Fatalf("expected missing relation sync_id error, got %v", err)
+	}
+
+	var chunks, mutations int
+	if err := cs.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM cloud_chunks WHERE project_name = $1`, project).Scan(&chunks); err != nil {
+		t.Fatalf("count chunks: %v", err)
+	}
+	if err := cs.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM cloud_mutations WHERE project = $1`, project).Scan(&mutations); err != nil {
+		t.Fatalf("count mutations: %v", err)
+	}
+	if chunks != 0 || mutations != 0 {
+		t.Fatalf("expected no persisted chunk or mutation after validation failure, got chunks=%d mutations=%d", chunks, mutations)
 	}
 }
 
@@ -641,6 +1018,52 @@ func TestWriteChunkMaterializesMutationsAndIsReplayIdempotent(t *testing.T) {
 	if len(mutationsAfterReplay) != 3 {
 		t.Fatalf("expected replay not to duplicate mutations, got %d: %+v", len(mutationsAfterReplay), mutationsAfterReplay)
 	}
+}
+
+func TestWriteChunkMaterializesCanonicalMutationOnlyUpserts(t *testing.T) {
+	cs := openTestCloudStore(t)
+	project := uniqueCloudstoreTestProject("mutation-only-upserts")
+	cleanupCloudstoreProject(t, cs, project)
+	payload, err := chunkcodec.CanonicalizeForProject([]byte(`{"mutations":[
+		{"entity":"session","entity_key":"sess-1","op":"upsert","payload":"{\"id\":\"sess-1\",\"project\":\"`+project+`\",\"directory\":\"/work\",\"started_at\":\"2026-05-04T09:00:00Z\"}"},
+		{"entity":"observation","entity_key":"obs-1","op":"upsert","payload":"{\"sync_id\":\"obs-1\",\"session_id\":\"sess-1\",\"project\":\"`+project+`\",\"type\":\"decision\",\"title\":\"Mutation only\",\"content\":\"materialized\",\"scope\":\"project\",\"created_at\":\"2026-05-04T09:01:00Z\"}"},
+		{"entity":"prompt","entity_key":"prompt-1","op":"upsert","payload":"{\"sync_id\":\"prompt-1\",\"session_id\":\"sess-1\",\"project\":\"`+project+`\",\"content\":\"mutation prompt\",\"created_at\":\"2026-05-04T09:02:00Z\"}"}
+	]}`), project)
+	if err != nil {
+		t.Fatalf("canonicalize chunk: %v", err)
+	}
+	ctx, chunkID := context.Background(), chunkIDFromPayload(payload)
+	if err := cs.WriteChunk(ctx, project, chunkID, "tester", "2026-05-04T09:03:00Z", payload); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	mutations, _, _, err := cs.ListMutationsSince(ctx, 0, 10, []string{project})
+	if err != nil || len(mutations) != 3 {
+		t.Fatalf("expected three materialized mutations, got %+v, %v", mutations, err)
+	}
+	seen := map[string]int{}
+	for _, mutation := range mutations {
+		seen[mutation.Entity+"/"+mutation.EntityKey]++
+	}
+	for _, key := range []string{"session/sess-1", "observation/obs-1", "prompt/prompt-1"} {
+		if seen[key] != 1 {
+			t.Fatalf("expected one materialized %s, got %+v", key, seen)
+		}
+	}
+	known, err := cs.KnownSessionIDs(ctx, project)
+	if err != nil || !containsSessionID(known, "sess-1") {
+		t.Fatalf("expected indexed mutation-only session, got %+v, %v", known, err)
+	}
+	if err := cs.WriteChunk(ctx, project, chunkID, "tester", "2026-05-04T09:03:00Z", payload); err != nil {
+		t.Fatalf("replay WriteChunk: %v", err)
+	}
+	if mutations, _, _, err = cs.ListMutationsSince(ctx, 0, 10, []string{project}); err != nil || len(mutations) != 3 {
+		t.Fatalf("expected idempotent replay, got %+v, %v", mutations, err)
+	}
+}
+
+func containsSessionID(ids map[string]struct{}, id string) bool {
+	_, ok := ids[id]
+	return ok
 }
 
 func TestBackfillMutationChunksMaterializesExistingMutationRows(t *testing.T) {

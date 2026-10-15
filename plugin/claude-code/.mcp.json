@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "engram": {
-      "type": "http",
-      "url": "https://engram-mcp.jcdcruz.com/mcp"
-    }
-  }
-}

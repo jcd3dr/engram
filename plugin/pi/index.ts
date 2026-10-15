@@ -37,6 +37,12 @@ Engram stores memory for many projects. Pass the \`project\` argument explicitly
 (mem_save, mem_search, mem_context, mem_session_summary, mem_save_prompt, mem_timeline, mem_stats, mem_review, mem_doctor).
 Do not rely on a default project: the server has none, and a call without \`project\` is rejected.
 
+### DELIVERY (mandatory)
+
+Memory operations are internal bookkeeping, never the user-facing answer.
+Complete required memory work before composing the completed-task reply; then send the complete answer as the final message of the turn with no later tool calls.
+If memory work fails or needs follow-up, still send the answer.
+
 ### WHEN TO SAVE (mandatory — not optional)
 
 Call \`mem_save\` IMMEDIATELY after any of these:

@@ -17,16 +17,16 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
-	"github.com/Gentleman-Programming/engram/internal/cloud/syncguidance"
-	"github.com/Gentleman-Programming/engram/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/constants"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/syncguidance"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
 // ─── Phase Constants ─────────────────────────────────────────────────────────
@@ -60,6 +60,7 @@ type PushMutationsResult struct {
 
 type PulledMutation struct {
 	Seq        int64           `json:"seq"`
+	Project    string          `json:"project"`
 	Entity     string          `json:"entity"`
 	EntityKey  string          `json:"entity_key"`
 	Op         string          `json:"op"`
@@ -85,12 +86,57 @@ type LocalStore interface {
 	AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error)
 	ReleaseSyncLease(targetKey, owner string) error
 	ApplyPulledMutation(targetKey string, mutation store.SyncMutation) error
+	ApplyPulledMutationPreservingSyncState(targetKey string, mutation store.SyncMutation) error
 	MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error
 	MarkSyncBlocked(targetKey, reasonCode, message string) error
+	MarkSyncBlockedAfterSuccess(targetKey, reasonCode, message string) error
 	MarkSyncHealthy(targetKey string) error
-	// Phase E: deferred relation retry.
-	ReplayDeferred() (store.ReplayDeferredResult, error)
-	CountDeferredAndDead() (deferred, dead int, err error)
+	ListDeferredProjectsForTarget(targetKey string) ([]string, error)
+	ReplayDeferredForScope(targetKey, project string) (store.ReplayDeferredResult, error)
+	CountDeferredAndDeadForScope(targetKey, project string) (deferred, dead int, err error)
+}
+
+type enrolledProjectRepairEnsurer interface {
+	EnsureEnrolledProjectSyncMutations(ctx context.Context) error
+}
+
+// irreparableSyncMutationQuarantiner prevents malformed legacy rows from
+// repeatedly reaching transport while preserving their local audit evidence.
+type irreparableSyncMutationQuarantiner interface {
+	QuarantineIrreparableSyncMutations(targetKey, project string, apply bool) (store.SyncMutationQuarantineReport, error)
+}
+
+// promptPreflightError means this entry was rejected before transport and remains pending.
+type promptPreflightError struct{ err error }
+
+func (e *promptPreflightError) Error() string { return e.err.Error() }
+func (e *promptPreflightError) Unwrap() error { return e.err }
+
+// Only a tree made entirely of known per-entry denials may bypass the push gate.
+func safeOutboundBlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch e := err.(type) {
+	case *nonEnrolledPendingError, *promptPreflightError:
+		return true
+	case interface{ Unwrap() []error }:
+		children := e.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !safeOutboundBlock(child) {
+				return false
+			}
+		}
+		return true
+	default:
+		if inner := errors.Unwrap(err); inner != nil {
+			return safeOutboundBlock(inner)
+		}
+		return false
+	}
 }
 
 type nonEnrolledPendingError struct {
@@ -107,6 +153,23 @@ type CloudTransport interface {
 	PullMutations(sinceSeq int64, limit int) (*PullMutationsResponse, error)
 }
 
+// Provenance capabilities are optional for legacy transports/stores, but keyed
+// prompts fail closed when either capability is unavailable.
+type pendingMutationPager interface {
+	ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int64, limit int) ([]store.SyncMutation, error)
+	MaxPendingSyncMutationSeq(targetKey string) (int64, error)
+}
+
+type localPromptProvenance interface {
+	LocalSessionProvenance(id string) (owner string, eligible bool, err error)
+	LocalPromptCreationIdentity(syncID string) (session, inbox, project string, eligible bool, err error)
+}
+
+type promptAuthorityTransport interface {
+	RegisterSessionAuthority(sessionID, ownerProject string) error
+	ClaimPromptPair(sessionID, sourceInboxID, syncID, ownerProject, promptProject string) error
+}
+
 // transportStatusError is an optional interface that transport errors may implement.
 // BW5: Allows Manager to detect 401 (auth_required) vs 403 (policy_forbidden)
 // vs generic transport failures without importing the remote package.
@@ -114,6 +177,21 @@ type transportStatusError interface {
 	IsAuthFailure() bool
 	IsPolicyFailure() bool
 }
+
+type reasonAwareFailureStore interface {
+	MarkSyncFailureWithReason(targetKey, reasonCode, message string, backoffUntil time.Time) error
+}
+
+type projectTransportFailure struct {
+	project string
+	err     error
+}
+
+func (e *projectTransportFailure) Error() string {
+	return fmt.Sprintf("transport push project %q: %v", e.project, e.err)
+}
+
+func (e *projectTransportFailure) Unwrap() error { return e.err }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -179,6 +257,11 @@ type Manager struct {
 	disabled  bool // set by StopForUpgrade, cleared by ResumeAfterUpgrade
 	wg        sync.WaitGroup
 	cancelFn  context.CancelFunc
+
+	// runReady closes once a Run launched via Start has registered with wg
+	// and is ready to serve. It stays nil until the first Start call, so
+	// managers driven by a bare Run keep their original Stop semantics.
+	runReady chan struct{}
 }
 
 // New creates a new background sync manager.
@@ -237,16 +320,57 @@ func (m *Manager) Status() Status {
 	m.mu.RUnlock()
 
 	// Phase E: populate deferred/dead counts from store (live query, best-effort).
-	if deferred, dead, err := m.store.CountDeferredAndDead(); err == nil {
+	if deferred, dead, err := m.store.CountDeferredAndDeadForScope(m.cfg.TargetKey, ""); err == nil {
 		st.DeferredCount = deferred
 		st.DeadCount = dead
 	}
 	return st
 }
 
+// Start launches the manager's Run loop in a background goroutine and returns
+// immediately. It installs the startup/shutdown handshake: the readiness
+// channel closes only after Run has registered with the wait group, so a
+// concurrent Stop always waits for the run loop to be schedulable before
+// tearing it down. Calling Start again reuses the existing channel; the
+// spawned Run hits the re-entry guard and never closes it a second time.
+//
+// Start on an already-running manager — including one launched by a bare Run
+// call that owns registration — is a no-op: it returns without touching
+// runReady and without spawning another Run, preserving the existing run
+// state. This keeps the bare Run-then-Start sequence returnable: previously a
+// late Start installed a fresh readiness channel no Run would ever close,
+// stranding a subsequent Stop on the handshake wait.
+func (m *Manager) Start(ctx context.Context) {
+	m.mu.Lock()
+	if m.cancelFn != nil {
+		// Already running (possibly via a bare Run that owns registration):
+		// do not install a readiness channel no Run will close.
+		m.mu.Unlock()
+		return
+	}
+	if m.runReady == nil {
+		m.runReady = make(chan struct{})
+	}
+	m.mu.Unlock()
+	go m.Run(ctx)
+}
+
 // Stop cancels the internal context and waits for all goroutines to exit.
-// Safe to call before Run — returns immediately in that case.
+// Safe to call before Run/Start — returns immediately in that case.
+// When Start was used, Stop first waits for the startup handshake so the run
+// loop has registered with the wait group (and set cancelFn) before shutdown.
 func (m *Manager) Stop() {
+	m.mu.Lock()
+	ready := m.runReady
+	m.mu.Unlock()
+
+	// Wait for the run loop to finish registering before reading cancelFn:
+	// a pre-wait read could see nil while the registering Run sets it right
+	// after the handshake closes.
+	if ready != nil {
+		<-ready
+	}
+
 	m.mu.Lock()
 	fn := m.cancelFn
 	m.mu.Unlock()
@@ -313,12 +437,20 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 	innerCtx, cancel := context.WithCancel(ctx)
 	m.cancelFn = cancel
+	// Startup handshake: only the Run that wins registration captures the
+	// readiness channel; a rejected re-entry Run must never close it.
+	ready := m.runReady
 	m.mu.Unlock()
 
 	m.wg.Add(1)
 	defer m.wg.Done()
 	defer cancel()
 	defer m.releaseLease()
+
+	// Registration is complete: release any Stop waiting for the handshake.
+	if ready != nil {
+		close(ready)
+	}
 
 	debounce := time.NewTimer(m.cfg.DebounceDuration)
 	if !debounce.Stop() {
@@ -358,9 +490,7 @@ func (m *Manager) safeRun(ctx context.Context) {
 			stack := string(debug.Stack())
 			log.Printf("[autosync] PANIC in cycle: %v\n%s", r, stack)
 			m.mu.Lock()
-			m.status.Phase = PhaseBackoff
-			m.status.ReasonCode = "internal_error"
-			m.status.ReasonMessage = fmt.Sprintf("panic: %v", r)
+			m.setCycleStatusLocked(PhaseBackoff, "internal_error", fmt.Sprintf("panic: %v", r))
 			m.status.ConsecutiveFailures++
 			bu := time.Now().Add(m.computeBackoff(m.status.ConsecutiveFailures))
 			m.status.BackoffUntil = &bu
@@ -388,8 +518,8 @@ func (m *Manager) cycle(ctx context.Context) {
 		return
 	}
 
-	// Check if we've exceeded the failure ceiling — enters PhaseBackoff.
-	if failures >= m.cfg.MaxConsecutiveFailures {
+	// At the failure ceiling, remain in backoff only until the current deadline expires.
+	if failures >= m.cfg.MaxConsecutiveFailures && backoffUntil != nil && time.Now().Before(*backoffUntil) {
 		m.setPhase(PhaseBackoff)
 		return
 	}
@@ -409,15 +539,31 @@ func (m *Manager) cycle(ctx context.Context) {
 	m.leaseHeld = true
 	m.mu.Unlock()
 
-	// Push, then pull.
+	// Only exclusively local per-entry preflight blocks can leave inbound
+	// replication independent of the outbound failure.
 	if err := m.push(ctx); err != nil {
-		var blocked *nonEnrolledPendingError
-		if errors.As(err, &blocked) {
-			m.recordBlocked(err.Error(), constants.ReasonNonEnrolledPendingMutations)
+		if !safeOutboundBlock(err) {
+			reasonCode := classifyTransportError(err)
+			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("push: %v", err), err), reasonCode)
 			return
 		}
-		reasonCode := classifyTransportError(err)
-		m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("push: %v", err), err), reasonCode)
+
+		blockedMessage := err.Error()
+		blockedReason := constants.ReasonNonEnrolledPendingMutations
+		var nonEnrolled *nonEnrolledPendingError
+		if !errors.As(err, &nonEnrolled) {
+			blockedReason = "prompt_provenance_blocked"
+		}
+		m.recordBlocked(blockedMessage, blockedReason)
+		if err := m.pullPreservingSyncState(ctx); err != nil {
+			reasonCode := classifyTransportError(err)
+			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
+			return
+		}
+		if err := m.recordBlockedAfterSuccess(blockedMessage, blockedReason); err != nil {
+			reasonCode := classifyTransportError(err)
+			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("persist blocked state after successful pull: %v", err), err), reasonCode)
+		}
 		return
 	}
 
@@ -454,22 +600,50 @@ func classifyTransportError(err error) string {
 }
 
 func autosyncFailureMessage(targetKey, message string, err error) string {
-	project := syncguidance.ProjectFromError(err)
+	project := projectForPolicyFailure(err)
+	if project == "" {
+		project = syncguidance.ProjectFromError(err)
+	}
 	if project == "" {
 		project = syncguidance.ProjectFromTargetKey(targetKey)
 	}
 	return syncguidance.AppendGuidance(message, project, err)
 }
 
+func projectForPolicyFailure(err error) string {
+	if err == nil {
+		return ""
+	}
+	if failure, ok := err.(*projectTransportFailure); ok && syncguidance.IsPolicyFailure(failure.err) {
+		return failure.project
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if project := projectForPolicyFailure(child); project != "" {
+				return project
+			}
+		}
+	}
+	return projectForPolicyFailure(errors.Unwrap(err))
+}
+
 // unwrapTransportStatusError walks the error chain looking for transportStatusError.
 func unwrapTransportStatusError(err error) (transportStatusError, bool) {
-	for err != nil {
-		if te, ok := err.(transportStatusError); ok {
-			return te, true
-		}
-		err = errors.Unwrap(err)
+	if err == nil {
+		return nil, false
 	}
-	return nil, false
+	if te, ok := err.(transportStatusError); ok {
+		return te, true
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, wrapped := range multi.Unwrap() {
+			if te, ok := unwrapTransportStatusError(wrapped); ok {
+				return te, true
+			}
+		}
+		return nil, false
+	}
+	return unwrapTransportStatusError(errors.Unwrap(err))
 }
 
 // ─── Push ────────────────────────────────────────────────────────────────────
@@ -480,12 +654,62 @@ func (m *Manager) push(ctx context.Context) error {
 	}
 
 	m.setPhase(PhasePushing)
-
-	pending, err := m.store.ListPendingSyncMutations(m.cfg.TargetKey, m.cfg.PushBatchSize)
-	if err != nil {
-		return fmt.Errorf("list pending: %w", err)
+	if repairer, ok := m.store.(enrolledProjectRepairEnsurer); ok {
+		if err := repairer.EnsureEnrolledProjectSyncMutations(ctx); err != nil {
+			return fmt.Errorf("repair enrolled sync journal: %w", err)
+		}
 	}
-	if len(pending) == 0 {
+	if quarantiner, ok := m.store.(irreparableSyncMutationQuarantiner); ok {
+		report, err := quarantiner.QuarantineIrreparableSyncMutations(m.cfg.TargetKey, "", true)
+		if err != nil {
+			return fmt.Errorf("quarantine irreparable pending mutations: %w", err)
+		}
+		if len(report.Actions) > 0 {
+			log.Printf("[autosync] quarantined %d irreparable pending mutation(s); inspect with `engram doctor --check sync_mutation_required_fields`", len(report.Actions))
+		}
+	}
+
+	pager, ok := m.store.(pendingMutationPager)
+	if !ok {
+		return fmt.Errorf("bounded pending mutation pagination unavailable")
+	}
+	// Snapshot the eligible journal after repair: new enqueues belong to a later cycle.
+	highWater, err := pager.MaxPendingSyncMutationSeq(m.cfg.TargetKey)
+	if err != nil {
+		return fmt.Errorf("read push high-water: %w", err)
+	}
+	var failures []error
+	var afterSeq int64
+	seen := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
+		}
+		pending, err := pager.ListPendingSyncMutationsAfterSeq(m.cfg.TargetKey, afterSeq, m.cfg.PushBatchSize)
+		if err != nil {
+			return errors.Join(append(failures, fmt.Errorf("list pending: %w", err))...)
+		}
+		page := make([]store.SyncMutation, 0, len(pending))
+		for _, mut := range pending {
+			if mut.Seq <= afterSeq {
+				return errors.Join(append(failures, fmt.Errorf("pending pagination did not advance"))...)
+			}
+			if mut.Seq > highWater {
+				break
+			}
+			page = append(page, mut)
+			afterSeq = mut.Seq
+		}
+		if len(page) == 0 {
+			break
+		}
+		seen = true
+		failures = append(failures, m.pushPage(ctx, page)...)
+		if len(pending) < m.cfg.PushBatchSize || afterSeq >= highWater {
+			break
+		}
+	}
+	if !seen {
 		counts, err := m.store.CountPendingNonEnrolledSyncMutations(m.cfg.TargetKey)
 		if err != nil {
 			return fmt.Errorf("count pending non-enrolled mutations: %w", err)
@@ -496,11 +720,21 @@ func (m *Manager) push(ctx context.Context) error {
 		return nil
 	}
 
-	// Group by project (preserve order).
+	return errors.Join(failures...)
+}
+
+func (m *Manager) pushPage(ctx context.Context, pending []store.SyncMutation) []error {
+	// Group by project (preserve order). Empty or padded project values are invalid
+	// for cloud transport: never send them, but continue with healthy project groups.
 	groups := make(map[string][]store.SyncMutation)
 	order := make([]string, 0)
+	var failures []error
 	for _, mut := range pending {
 		project := mut.Project
+		if strings.TrimSpace(project) != project || project == "" {
+			failures = append(failures, fmt.Errorf("pending mutation seq %d (%s/%s) has an empty or padded project and was not sent; repair local project metadata or inspect `engram doctor --check sync_mutation_required_fields`", mut.Seq, mut.Entity, mut.EntityKey))
+			continue
+		}
 		if _, ok := groups[project]; !ok {
 			order = append(order, project)
 		}
@@ -508,57 +742,119 @@ func (m *Manager) push(ctx context.Context) error {
 	}
 
 	for _, project := range order {
-		batch := groups[project]
-		entries := make([]MutationEntry, len(batch))
-		seqs := make([]int64, len(batch))
-		for i, mut := range batch {
-			entries[i] = MutationEntry{
-				Project:   mut.Project,
-				Entity:    mut.Entity,
-				EntityKey: mut.EntityKey,
-				Op:        mut.Op,
-				Payload:   json.RawMessage(mut.Payload),
-			}
-			seqs[i] = mut.Seq
+		if err := ctx.Err(); err != nil {
+			failures = append(failures, err)
+			return failures
 		}
-
+		batch := groups[project]
+		entries := make([]MutationEntry, 0, len(batch))
+		seqs := make([]int64, 0, len(batch))
+		for _, mut := range batch {
+			if mut.Entity == store.SyncEntityPrompt {
+				var identity struct {
+					SyncID  string `json:"sync_id"`
+					Session string `json:"session_id"`
+					Inbox   string `json:"source_inbox_id"`
+					Project string `json:"project"`
+				}
+				if err := json.Unmarshal([]byte(mut.Payload), &identity); err != nil {
+					failures = append(failures, fmt.Errorf("prompt seq %d: invalid identity: %w", mut.Seq, err))
+					continue
+				}
+				if identity.SyncID == "" || identity.SyncID != mut.EntityKey || identity.Project != project || identity.Session == "" {
+					failures = append(failures, fmt.Errorf("prompt seq %d: invalid journal identity", mut.Seq))
+					continue
+				}
+				if identity.Inbox != "" {
+					if err := m.preflightPrompt(mut, identity.SyncID, identity.Session, identity.Inbox, identity.Project); err != nil {
+						failures = append(failures, fmt.Errorf("prompt seq %d: %w", mut.Seq, err))
+						continue
+					}
+				}
+			}
+			entries = append(entries, MutationEntry{
+				Project: mut.Project, Entity: mut.Entity, EntityKey: mut.EntityKey,
+				Op: mut.Op, Payload: json.RawMessage(mut.Payload),
+			})
+			seqs = append(seqs, mut.Seq)
+		}
+		if len(entries) == 0 {
+			continue
+		}
 		result, err := m.transport.PushMutations(entries)
 		if err != nil {
-			return fmt.Errorf("transport push project %q: %w", project, err)
+			failures = append(failures, &projectTransportFailure{project: project, err: err})
+			continue
 		}
 		if result == nil {
-			return fmt.Errorf("transport push project %q: missing accepted seqs for %d mutations", project, len(entries))
+			failures = append(failures, fmt.Errorf("transport push project %q: missing accepted seqs for %d mutations", project, len(entries)))
+			continue
 		}
 		if len(result.AcceptedSeqs) != len(entries) {
-			return fmt.Errorf("transport push project %q: cloud accepted %d of %d mutations; refusing to ack local seqs", project, len(result.AcceptedSeqs), len(entries))
+			failures = append(failures, fmt.Errorf("transport push project %q: cloud accepted %d of %d mutations; refusing to ack local seqs", project, len(result.AcceptedSeqs), len(entries)))
+			continue
 		}
 		if err := m.store.AckSyncMutationSeqs(m.cfg.TargetKey, seqs); err != nil {
-			return fmt.Errorf("ack project %q: %w", project, err)
+			failures = append(failures, fmt.Errorf("ack project %q: %w", project, err))
+			return failures
 		}
 	}
 
+	return failures
+}
+
+func (m *Manager) preflightPrompt(mut store.SyncMutation, syncID, session, inbox, project string) error {
+	if syncID == "" || session == "" || inbox == "" || project == "" ||
+		syncID != mut.EntityKey || project != mut.Project {
+		return &promptPreflightError{err: fmt.Errorf("unverified keyed prompt mutation identity")}
+	}
+	local, ok := m.store.(localPromptProvenance)
+	if !ok {
+		return fmt.Errorf("local prompt provenance unavailable")
+	}
+	remote, ok := m.transport.(promptAuthorityTransport)
+	if !ok {
+		return fmt.Errorf("remote prompt authority unavailable")
+	}
+	originalSession, originalInbox, originalProject, eligible, err := local.LocalPromptCreationIdentity(syncID)
+	if err != nil {
+		return fmt.Errorf("read local prompt origin: %w", err)
+	}
+	if !eligible || originalSession != session || originalInbox != inbox || originalProject != project {
+		return &promptPreflightError{err: fmt.Errorf("unverified keyed prompt origin")}
+	}
+	owner, eligible, err := local.LocalSessionProvenance(session)
+	if err != nil {
+		return fmt.Errorf("read local session origin: %w", err)
+	}
+	if !eligible || owner == "" {
+		return &promptPreflightError{err: fmt.Errorf("unverified local session owner")}
+	}
+	if err := remote.RegisterSessionAuthority(session, owner); err != nil {
+		return fmt.Errorf("register session authority: %w", err)
+	}
+	if err := remote.ClaimPromptPair(session, inbox, syncID, owner, project); err != nil {
+		return fmt.Errorf("claim prompt pair: %w", err)
+	}
 	return nil
 }
 
 // ─── Pull ────────────────────────────────────────────────────────────────────
 
 func (m *Manager) pull(ctx context.Context) error {
+	return m.pullWithSyncState(ctx, false)
+}
+
+func (m *Manager) pullPreservingSyncState(ctx context.Context) error {
+	return m.pullWithSyncState(ctx, true)
+}
+
+func (m *Manager) pullWithSyncState(ctx context.Context, preserveSyncState bool) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
 	m.setPhase(PhasePulling)
-
-	// Phase E: replay deferred relation rows before fetching new mutations.
-	// This gives previously-deferred rows a chance to apply now that their
-	// referenced observations may have arrived.
-	if res, err := m.store.ReplayDeferred(); err != nil {
-		log.Printf("[autosync] replayDeferred error: %v", err)
-		// Non-fatal: log and continue — deferred replay failures must not halt pulls.
-	} else if res.Retried > 0 {
-		log.Printf("[autosync] replayDeferred: retried=%d succeeded=%d failed=%d dead=%d",
-			res.Retried, res.Succeeded, res.Failed, res.Dead)
-	}
 
 	state, err := m.store.GetSyncState(m.cfg.TargetKey)
 	if err != nil {
@@ -567,6 +863,8 @@ func (m *Manager) pull(ctx context.Context) error {
 
 	sinceSeq := state.LastPulledSeq
 
+	touchedProjects := make(map[string]struct{})
+	projectOrder := make([]string, 0)
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -581,6 +879,7 @@ func (m *Manager) pull(ctx context.Context) error {
 			localMut := store.SyncMutation{
 				Seq:        rm.Seq,
 				TargetKey:  m.cfg.TargetKey,
+				Project:    rm.Project,
 				Entity:     rm.Entity,
 				EntityKey:  rm.EntityKey,
 				Op:         rm.Op,
@@ -592,8 +891,20 @@ func (m *Manager) pull(ctx context.Context) error {
 			// ApplyPulledMutation handles relation FK misses internally by writing
 			// to sync_apply_deferred and returning nil — the cursor advances normally.
 			// All other errors (legacy entities, decode errors) propagate and halt the pull.
-			if err := m.store.ApplyPulledMutation(m.cfg.TargetKey, localMut); err != nil {
+			if preserveSyncState {
+				err = m.store.ApplyPulledMutationPreservingSyncState(m.cfg.TargetKey, localMut)
+			} else {
+				err = m.store.ApplyPulledMutation(m.cfg.TargetKey, localMut)
+			}
+			if err != nil {
 				return fmt.Errorf("apply pulled mutation seq=%d: %w", rm.Seq, err)
+			}
+			project := strings.TrimSpace(rm.Project)
+			if project != "" {
+				if _, seen := touchedProjects[project]; !seen {
+					touchedProjects[project] = struct{}{}
+					projectOrder = append(projectOrder, project)
+				}
 			}
 			if rm.Seq > sinceSeq {
 				sinceSeq = rm.Seq
@@ -605,15 +916,53 @@ func (m *Manager) pull(ctx context.Context) error {
 		}
 	}
 
+	pendingProjects, err := m.store.ListDeferredProjectsForTarget(m.cfg.TargetKey)
+	if err != nil {
+		log.Printf("[autosync] list deferred projects target=%q error: %v", m.cfg.TargetKey, err)
+	} else {
+		for _, project := range pendingProjects {
+			project = strings.TrimSpace(project)
+			if project == "" {
+				continue
+			}
+			if _, seen := touchedProjects[project]; seen {
+				continue
+			}
+			touchedProjects[project] = struct{}{}
+			projectOrder = append(projectOrder, project)
+		}
+	}
+	sort.Strings(projectOrder)
+
+	for _, project := range projectOrder {
+		if res, err := m.store.ReplayDeferredForScope(m.cfg.TargetKey, project); err != nil {
+			log.Printf("[autosync] replayDeferred project=%q error: %v", project, err)
+		} else if res.Retried > 0 {
+			log.Printf("[autosync] replayDeferred project=%q retried=%d succeeded=%d failed=%d dead=%d",
+				project, res.Retried, res.Succeeded, res.Failed, res.Dead)
+		}
+	}
+
 	return nil
 }
 
 // ─── State Tracking ──────────────────────────────────────────────────────────
 
+// setCycleStatusLocked keeps the upgrade pause authoritative until resume.
+// Callers hold m.mu; admitted cycles still record and persist their outcomes.
+func (m *Manager) setCycleStatusLocked(phase, reasonCode, reasonMessage string) {
+	if m.disabled {
+		return
+	}
+	m.status.Phase = phase
+	m.status.ReasonCode = reasonCode
+	m.status.ReasonMessage = reasonMessage
+}
+
 func (m *Manager) setPhase(phase string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.status.Phase = phase
+	m.setCycleStatusLocked(phase, m.status.ReasonCode, m.status.ReasonMessage)
 }
 
 // recordFailureWithReason records a failure with an explicit reason code.
@@ -624,44 +973,59 @@ func (m *Manager) recordFailureWithReason(msg, reasonCode string) {
 	failures := m.status.ConsecutiveFailures + 1
 	m.status.ConsecutiveFailures = failures
 	m.status.LastError = msg
-	m.status.ReasonCode = reasonCode
 
 	backoff := m.computeBackoff(failures)
 	bu := time.Now().Add(backoff)
 	m.status.BackoffUntil = &bu
 
+	phase := PhasePullFailed
 	if m.status.Phase == PhasePushing {
-		m.status.Phase = PhasePushFailed
-	} else {
-		m.status.Phase = PhasePullFailed
+		phase = PhasePushFailed
 	}
+	m.setCycleStatusLocked(phase, reasonCode, msg)
 	m.mu.Unlock()
 
+	if reasonAware, ok := m.store.(reasonAwareFailureStore); ok {
+		_ = reasonAware.MarkSyncFailureWithReason(m.cfg.TargetKey, reasonCode, msg, bu)
+		return
+	}
 	_ = m.store.MarkSyncFailure(m.cfg.TargetKey, msg, bu)
 }
 
 func (m *Manager) recordBlocked(msg, reasonCode string) {
 	m.mu.Lock()
-	m.status.Phase = PhasePushFailed
+	m.setCycleStatusLocked(PhasePushFailed, reasonCode, msg)
 	m.status.LastError = msg
-	m.status.ReasonCode = reasonCode
-	m.status.ReasonMessage = msg
 	m.status.BackoffUntil = nil
 	m.mu.Unlock()
 
 	_ = m.store.MarkSyncBlocked(m.cfg.TargetKey, reasonCode, msg)
 }
 
+func (m *Manager) recordBlockedAfterSuccess(msg, reasonCode string) error {
+	if err := m.store.MarkSyncBlockedAfterSuccess(m.cfg.TargetKey, reasonCode, msg); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	m.mu.Lock()
+	m.setCycleStatusLocked(PhasePushFailed, reasonCode, msg)
+	m.status.ConsecutiveFailures = 0
+	m.status.LastError = msg
+	m.status.BackoffUntil = nil
+	m.status.LastSyncAt = &now
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *Manager) recordSuccess() {
 	now := time.Now()
 	m.mu.Lock()
-	m.status.Phase = PhaseHealthy
+	m.setCycleStatusLocked(PhaseHealthy, "", "")
 	m.status.ConsecutiveFailures = 0
 	m.status.LastError = ""
 	m.status.BackoffUntil = nil
 	m.status.LastSyncAt = &now
-	m.status.ReasonCode = ""
-	m.status.ReasonMessage = ""
 	m.mu.Unlock()
 
 	_ = m.store.MarkSyncHealthy(m.cfg.TargetKey)
@@ -682,23 +1046,34 @@ func (m *Manager) computeBackoff(failures int) time.Duration {
 	if failures <= 0 {
 		return m.cfg.BaseBackoff
 	}
-	exp := math.Pow(2, float64(failures-1))
-	base := time.Duration(float64(m.cfg.BaseBackoff) * exp)
+	base := m.cfg.BaseBackoff
 	if base > m.cfg.MaxBackoff {
 		base = m.cfg.MaxBackoff
+	}
+	for i := 1; i < failures && base < m.cfg.MaxBackoff; i++ {
+		if base > m.cfg.MaxBackoff/2 {
+			base = m.cfg.MaxBackoff
+		} else {
+			base *= 2
+		}
 	}
 	// ±25% jitter: uniform in [-base/4, +base/4].
 	// rand.Int63n(int64(base/2)+1) gives [0, base/2]; subtracting base/4 shifts to [-base/4, +base/4].
 	jitter := time.Duration(rand.Int63n(int64(base/2)+1)) - time.Duration(base/4)
-	result := base + jitter
-	if result > m.cfg.MaxBackoff {
-		result = m.cfg.MaxBackoff
-	}
+	result := saturatingAddBackoffJitter(base, jitter, m.cfg.MaxBackoff)
 	// Floor at BaseBackoff/2 to avoid extremely short intervals on large negative jitter.
 	if result < m.cfg.BaseBackoff/2 {
 		result = m.cfg.BaseBackoff / 2
 	}
 	return result
+}
+
+func saturatingAddBackoffJitter(base, jitter, maxBackoff time.Duration) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	if jitter > 0 && (base > maxBackoff-jitter || base > maxDuration-jitter) {
+		return maxBackoff
+	}
+	return base + jitter
 }
 
 func (m *Manager) releaseLease() {

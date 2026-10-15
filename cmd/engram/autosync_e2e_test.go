@@ -7,16 +7,60 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud/autosync"
-	"github.com/Gentleman-Programming/engram/internal/cloud/remote"
-	"github.com/Gentleman-Programming/engram/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/autosync"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/remote"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 	_ "modernc.org/sqlite"
 )
+
+func TestMutationTransportAdapterForwardsPromptAuthority(t *testing.T) {
+	var paths []string
+	var bodies []map[string]string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Errorf("unexpected request security or method: TLS=%v method=%s auth=%q", r.TLS != nil, r.Method, r.Header.Get("Authorization"))
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		paths = append(paths, r.URL.Path)
+		bodies = append(bodies, body)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+	defer srv.Close()
+	trustTLSServer(t, srv)
+
+	mt, err := remote.NewMutationTransport(srv.URL, "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &mutationTransportAdapter{remote: mt}
+	if err := adapter.RegisterSessionAuthority("session-1", "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.ClaimPromptPair("session-1", "inbox-2", "sync-3", "alpha", "beta"); err != nil {
+		t.Fatal(err)
+	}
+	wantPaths := []string{"/sync/session-authorities", "/sync/prompt-pair-claims"}
+	wantBodies := []map[string]string{
+		{"session_id": "session-1", "project": "alpha"},
+		{"session_id": "session-1", "source_inbox_id": "inbox-2", "sync_id": "sync-3", "owner_project": "alpha", "project": "beta"},
+	}
+	if !reflect.DeepEqual(paths, wantPaths) || !reflect.DeepEqual(bodies, wantBodies) {
+		t.Fatalf("requests: paths=%v bodies=%v; want paths=%v bodies=%v", paths, bodies, wantPaths, wantBodies)
+	}
+}
 
 // ─── E2E Round-trip test (REQ-212) ───────────────────────────────────────────
 
@@ -29,7 +73,7 @@ func TestAutosyncPushPullRoundTrip(t *testing.T) {
 	latestSeq := int64(0)
 
 	// Fake cloud server implementing /sync/mutations/push and /sync/mutations/pull
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if auth != "Bearer test-token" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -88,6 +132,7 @@ func TestAutosyncPushPullRoundTrip(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	trustTLSServer(t, srv)
 
 	// Create a real MutationTransport pointing at the test server.
 	mt, err := remote.NewMutationTransport(srv.URL, "test-token")
@@ -131,10 +176,11 @@ func TestAutosyncPushPullRoundTrip(t *testing.T) {
 // when the cloud transport is returning 500.
 func TestLocalWriteDuringTransport500(t *testing.T) {
 	// Fake cloud server always returns 500.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
+	trustTLSServer(t, srv)
 
 	mt, err := remote.NewMutationTransport(srv.URL, "test-token")
 	if err != nil {
@@ -182,7 +228,7 @@ func TestLocalWriteDuringTransport500(t *testing.T) {
 // writes complete without deadlock while autosync is running in the background.
 func TestGoroutineIsolationConcurrentWrites(t *testing.T) {
 	// Fake cloud server with artificial delay to simulate network I/O.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(5 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -195,6 +241,7 @@ func TestGoroutineIsolationConcurrentWrites(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	trustTLSServer(t, srv)
 
 	mt, err := remote.NewMutationTransport(srv.URL, "test-token")
 	if err != nil {
@@ -302,6 +349,33 @@ func (s *autosyncFakeStore) ListPendingSyncMutations(_ string, limit int) ([]sto
 	return result, nil
 }
 
+func (s *autosyncFakeStore) MaxPendingSyncMutationSeq(string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var max int64
+	for _, mutation := range s.mutations {
+		max = mutation.seq
+	}
+	return max, nil
+}
+
+func (s *autosyncFakeStore) ListPendingSyncMutationsAfterSeq(target string, after int64, limit int) ([]store.SyncMutation, error) {
+	pending, err := s.ListPendingSyncMutations(target, len(s.mutations))
+	if err != nil {
+		return nil, err
+	}
+	var page []store.SyncMutation
+	for _, mutation := range pending {
+		if mutation.Seq > after {
+			page = append(page, mutation)
+			if len(page) == limit {
+				break
+			}
+		}
+	}
+	return page, nil
+}
+
 func (s *autosyncFakeStore) CountPendingNonEnrolledSyncMutations(_ string) ([]store.PendingSyncMutationProjectCount, error) {
 	return nil, nil
 }
@@ -336,18 +410,30 @@ func (s *autosyncFakeStore) ReleaseSyncLease(_, _ string) error { return nil }
 
 func (s *autosyncFakeStore) ApplyPulledMutation(_ string, _ store.SyncMutation) error { return nil }
 
+func (s *autosyncFakeStore) ApplyPulledMutationPreservingSyncState(_ string, _ store.SyncMutation) error {
+	return nil
+}
+
 func (s *autosyncFakeStore) MarkSyncFailure(_, _ string, _ time.Time) error { return nil }
 
 func (s *autosyncFakeStore) MarkSyncBlocked(_, _, _ string) error { return nil }
 
+func (s *autosyncFakeStore) MarkSyncBlockedAfterSuccess(_, _, _ string) error { return nil }
+
 func (s *autosyncFakeStore) MarkSyncHealthy(_ string) error { return nil }
 
+func (s *autosyncFakeStore) ListDeferredProjectsForTarget(_ string) ([]string, error) {
+	return nil, nil
+}
+
 // Phase E: deferred replay stubs — no-ops for the E2E fake store.
-func (s *autosyncFakeStore) ReplayDeferred() (store.ReplayDeferredResult, error) {
+func (s *autosyncFakeStore) ReplayDeferredForScope(_, _ string) (store.ReplayDeferredResult, error) {
 	return store.ReplayDeferredResult{}, nil
 }
 
-func (s *autosyncFakeStore) CountDeferredAndDead() (int, int, error) { return 0, 0, nil }
+func (s *autosyncFakeStore) CountDeferredAndDeadForScope(_, _ string) (int, int, error) {
+	return 0, 0, nil
+}
 
 // httpPushMutations is a helper to push mutations directly to a test server.
 func httpPushMutations(t *testing.T, serverURL, token string, entries []map[string]any) *http.Response {
@@ -361,4 +447,11 @@ func httpPushMutations(t *testing.T, serverURL, token string, entries []map[stri
 		t.Fatalf("httpPushMutations: %v", err)
 	}
 	return resp
+}
+
+func trustTLSServer(t *testing.T, server *httptest.Server) {
+	t.Helper()
+	previous := http.DefaultTransport
+	http.DefaultTransport = server.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = previous })
 }

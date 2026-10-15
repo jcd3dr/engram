@@ -1,12 +1,19 @@
 package project
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ─── extractRepoName unit tests ──────────────────────────────────────────────
@@ -53,6 +60,28 @@ func TestExtractRepoName(t *testing.T) {
 			want: "my-project",
 		},
 		{
+			// Preserve the spelling used by existing detected project buckets.
+			name: "Azure DevOps HTTPS remote with encoded space",
+			url:  "https://org.visualstudio.com/My%20Project/_git/My%20Project",
+			want: "My%20Project",
+		},
+		{
+			name: "Azure DevOps SSH v3 remote with encoded space",
+			url:  "git@ssh.dev.azure.com:v3/org/My%20Project/Repo/My%20Project",
+			want: "My%20Project",
+		},
+		{
+			// Detection does not decode even one layer.
+			name: "Double-encoded name stays literal",
+			url:  "https://host/group/my%2520repo.git",
+			want: "my%2520repo",
+		},
+		{
+			name: "Invalid percent escape stays raw",
+			url:  "https://host/user/100%.git",
+			want: "100%",
+		},
+		{
 			name: "Empty URL returns empty",
 			url:  "",
 			want: "",
@@ -69,7 +98,7 @@ func TestExtractRepoName(t *testing.T) {
 	}
 }
 
-// ─── DetectProject integration tests ─────────────────────────────────────────
+// ─── DetectProjectFull integration tests ─────────────────────────────────────
 
 // initGit initialises a new git repository in dir. Helper for tests.
 func initGit(t *testing.T, dir string) {
@@ -87,7 +116,23 @@ func initGit(t *testing.T, dir string) {
 	run("config", "user.name", "Test User")
 }
 
-func TestDetectProject_GitRemote(t *testing.T) {
+func commitEmptyGit(t *testing.T, dir string) {
+	t.Helper()
+	cmd := exec.Command("git", "-C", dir, "commit", "--allow-empty", "-m", "initial commit")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+}
+
+func addGitWorktree(t *testing.T, repo, worktree, branch string) {
+	t.Helper()
+	cmd := exec.Command("git", "-C", repo, "worktree", "add", "-b", branch, worktree)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v\n%s", err, out)
+	}
+}
+
+func TestDetectProjectFull_GitRemote(t *testing.T) {
 	dir := t.TempDir()
 	initGit(t, dir)
 
@@ -98,13 +143,16 @@ func TestDetectProject_GitRemote(t *testing.T) {
 		t.Fatalf("git remote add: %v\n%s", err, out)
 	}
 
-	got := DetectProject(dir)
-	if got != "my-cool-repo" {
-		t.Errorf("DetectProject with remote = %q; want %q", got, "my-cool-repo")
+	res := DetectProjectFull(dir)
+	if res.Error != nil {
+		t.Fatal(res.Error)
+	}
+	if res.Project != "my-cool-repo" {
+		t.Errorf("DetectProjectFull with remote = %q; want %q", res.Project, "my-cool-repo")
 	}
 }
 
-func TestDetectProject_GitRemote_HTTPS(t *testing.T) {
+func TestDetectProjectFull_GitRemote_HTTPS(t *testing.T) {
 	dir := t.TempDir()
 	initGit(t, dir)
 
@@ -114,53 +162,102 @@ func TestDetectProject_GitRemote_HTTPS(t *testing.T) {
 		t.Fatalf("git remote add: %v\n%s", err, out)
 	}
 
-	got := DetectProject(dir)
-	if got != "engram" {
-		t.Errorf("DetectProject HTTPS remote = %q; want %q", got, "engram")
+	res := DetectProjectFull(dir)
+	if res.Error != nil {
+		t.Fatal(res.Error)
+	}
+	if res.Project != "engram" {
+		t.Errorf("DetectProjectFull HTTPS remote = %q; want %q", res.Project, "engram")
 	}
 }
 
-func TestDetectProject_GitRootNoRemote(t *testing.T) {
+// Detection preserves encoded names; cloud selection can opt into literal input.
+func TestDetectProjectFull_GitRemote_PercentEncoded(t *testing.T) {
+	dir := t.TempDir()
+	initGit(t, dir)
+
+	cmd := exec.Command("git", "-C", dir, "remote", "add", "origin",
+		"https://org.visualstudio.com/My%20Project/_git/My%20Project")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+
+	res := DetectProjectFull(dir)
+	if res.Error != nil {
+		t.Fatal(res.Error)
+	}
+	if res.Project != "my%20project" {
+		t.Errorf("DetectProjectFull percent-encoded remote = %q; want %q", res.Project, "my%20project")
+	}
+}
+
+func TestDetectProjectFull_LiteralRemoteNames(t *testing.T) {
+	for _, remote := range []string{"https://host/team/my%2520repo.git", "https://host/team/my%2Frepo.git", "https://host/team/my%5Crepo.git", filepath.ToSlash(filepath.Join(t.TempDir(), "my%20repo.git"))} {
+		t.Run(remote, func(t *testing.T) {
+			dir := t.TempDir()
+			initGit(t, dir)
+			if out, err := exec.Command("git", "-C", dir, "remote", "add", "origin", remote).CombinedOutput(); err != nil {
+				t.Fatalf("remote: %v: %s", err, out)
+			}
+			want := strings.ToLower(strings.TrimSuffix(filepath.Base(remote), ".git"))
+			res := DetectProjectFull(dir)
+			if res.Error != nil || res.Source != SourceGitRemote || res.Project != want {
+				t.Fatalf("detection = %+v, want literal %q", res, want)
+			}
+		})
+	}
+}
+
+func TestDetectProjectFull_GitRootNoRemote(t *testing.T) {
 	dir := t.TempDir()
 	initGit(t, dir)
 	// No remote configured — should fall back to basename of git root
 
-	got := DetectProject(dir)
+	res := DetectProjectFull(dir)
+	if res.Error != nil {
+		t.Fatal(res.Error)
+	}
 	want := filepath.Base(dir)
-	// Normalize to lowercase to match DetectProject output
+	// Normalize to lowercase to match DetectProjectFull output
 	wantLower := strings.ToLower(want)
-	if got != wantLower {
-		t.Errorf("DetectProject no-remote = %q; want %q", got, wantLower)
+	if res.Project != wantLower {
+		t.Errorf("DetectProjectFull no-remote = %q; want %q", res.Project, wantLower)
 	}
 }
 
-func TestDetectProject_NonGitDir(t *testing.T) {
+func TestDetectProjectFull_NonGitDir(t *testing.T) {
 	dir := t.TempDir()
 	// Not a git repo — should fall back to basename of dir
 
-	got := DetectProject(dir)
+	res := DetectProjectFull(dir)
+	if res.Error != nil {
+		t.Fatal(res.Error)
+	}
 	want := strings.ToLower(filepath.Base(dir))
-	if got != want {
-		t.Errorf("DetectProject non-git = %q; want %q", got, want)
+	if res.Project != want {
+		t.Errorf("DetectProjectFull non-git = %q; want %q", res.Project, want)
 	}
 }
 
-func TestDetectProject_EmptyDir_NoPanic(t *testing.T) {
-	// Even an empty string for dir should not panic
+func TestDetectProjectFull_EmptyDir_NoPanic(t *testing.T) {
+	// Even an empty string for dir should not panic.
 	defer func() {
 		if r := recover(); r != nil {
-			t.Errorf("DetectProject panicked: %v", r)
+			t.Errorf("DetectProjectFull panicked: %v", r)
 		}
 	}()
-	got := DetectProject("")
-	// Just verify it returns something non-empty (the exact value depends on OS)
-	if got == "" {
-		t.Error("DetectProject(\"\") returned empty string")
+	res := DetectProjectFull("")
+	if res.Error != nil {
+		t.Fatal(res.Error)
+	}
+	// Just verify it returns something non-empty (the exact value depends on OS).
+	if res.Project == "" {
+		t.Error("DetectProjectFull(\"\").Project returned empty string")
 	}
 }
 
-func TestDetectProject_NormalizedLowercase(t *testing.T) {
-	// DetectProject must always return lowercase names.
+func TestDetectProjectFull_NormalizedLowercase(t *testing.T) {
+	// DetectProjectFull must return lowercase names.
 	// Create a temp dir whose basename has upper-case letters.
 	parent := t.TempDir()
 	upper := filepath.Join(parent, "MyProject")
@@ -168,13 +265,16 @@ func TestDetectProject_NormalizedLowercase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := DetectProject(upper)
-	if got != "myproject" {
-		t.Errorf("DetectProject uppercase dir = %q; want %q", got, "myproject")
+	res := DetectProjectFull(upper)
+	if res.Error != nil {
+		t.Fatal(res.Error)
+	}
+	if res.Project != "myproject" {
+		t.Errorf("DetectProjectFull uppercase dir = %q; want %q", res.Project, "myproject")
 	}
 }
 
-func TestDetectProject_GitRemoteCasing(t *testing.T) {
+func TestDetectProjectFull_GitRemoteCasing(t *testing.T) {
 	// Remote repo name like "MyRepo.git" should be lowercased.
 	dir := t.TempDir()
 	initGit(t, dir)
@@ -185,9 +285,12 @@ func TestDetectProject_GitRemoteCasing(t *testing.T) {
 		t.Fatalf("git remote add: %v\n%s", err, out)
 	}
 
-	got := DetectProject(dir)
-	if got != "myrepo" {
-		t.Errorf("DetectProject uppercase remote name = %q; want %q", got, "myrepo")
+	res := DetectProjectFull(dir)
+	if res.Error != nil {
+		t.Fatal(res.Error)
+	}
+	if res.Project != "myrepo" {
+		t.Errorf("DetectProjectFull uppercase remote name = %q; want %q", res.Project, "myrepo")
 	}
 }
 
@@ -217,6 +320,20 @@ func TestDetectProjectFull_Case1_Remote(t *testing.T) {
 	}
 	if res.Error != nil {
 		t.Errorf("unexpected error: %v", res.Error)
+	}
+}
+
+func TestDetectProjectFull_GitRemoteCanonicalizesRepeatedSeparators(t *testing.T) {
+	dir := t.TempDir()
+	initGit(t, dir)
+	cmd := exec.Command("git", "-C", dir, "remote", "add", "origin", "git@github.com:testuser/Foo--Bar__Baz.git")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+
+	res := DetectProjectFull(dir)
+	if res.Source != SourceGitRemote || res.Project != "foo-bar_baz" {
+		t.Fatalf("git remote detection = %+v, want source=%q project=%q", res, SourceGitRemote, "foo-bar_baz")
 	}
 }
 
@@ -251,6 +368,22 @@ func TestDetectProjectFull_ConfigFromRepoRootOverridesRemoteFromSubdir(t *testin
 	wantPath, _ := filepath.EvalSymlinks(root)
 	if got, want := gotPath, wantPath; got != want {
 		t.Fatalf("expected config path %q, got %q", want, got)
+	}
+}
+
+func TestDetectProjectFull_ConfigCanonicalizesRepeatedSeparators(t *testing.T) {
+	dir := t.TempDir()
+	configDir := filepath.Join(dir, ".engram")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"project_name":"Foo--Bar__Baz"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := DetectProjectFull(dir)
+	if res.Source != SourceConfig || res.Project != "foo-bar_baz" {
+		t.Fatalf("config detection = %+v, want source=%q project=%q", res, SourceConfig, "foo-bar_baz")
 	}
 }
 
@@ -562,6 +695,87 @@ func TestDetectProjectFull_Case3_SingleChild(t *testing.T) {
 	}
 }
 
+func TestDetectProjectFull_Case3_CanonicalChildIdentity(t *testing.T) {
+	tests := []struct {
+		name, config, remote string
+		bind, invalidBinding bool
+		want                 string
+		wantError            error
+	}{
+		{name: "explicit config", config: `{"project_name":"Configured Child"}`, want: "configured child"},
+		{name: "remote identity", remote: "git@github.com:team/remote-child.git", want: "remote-child"},
+		{name: "existing binding wins over remote", remote: "git@github.com:team/new-remote.git", bind: true, want: "original-child"},
+		{name: "invalid config", config: `{"project_name":"bad/name"}`, wantError: ErrInvalidConfig},
+		{name: "invalid binding", invalidBinding: true, wantError: ErrRepositoryBinding},
+		{name: "ordinary fallback", want: "folder-child"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := t.TempDir()
+			child := filepath.Join(parent, "folder-child")
+			if err := os.Mkdir(child, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			initGit(t, child)
+			if tt.bind {
+				if got := DetectProjectFull(child); got.Error != nil {
+					t.Fatal(got.Error)
+				}
+				bindingPath := repositoryBindingPath(detectGitCommonDir(child))
+				data, err := os.ReadFile(bindingPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var binding repositoryBinding
+				if err := json.Unmarshal(data, &binding); err != nil {
+					t.Fatal(err)
+				}
+				binding.Project = "original-child"
+				data, err = json.Marshal(binding)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(bindingPath, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.invalidBinding {
+				if err := os.WriteFile(repositoryBindingPath(detectGitCommonDir(child)), []byte("invalid"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.remote != "" {
+				cmd := exec.Command("git", "-C", child, "remote", "add", "origin", tt.remote)
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("git remote add: %v: %s", err, out)
+				}
+			}
+			if tt.config != "" {
+				if err := os.Mkdir(filepath.Join(child, ".engram"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(child, ".engram", "config.json"), []byte(tt.config), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fromChild := DetectProjectFull(child)
+			fromParent := DetectProjectFull(parent)
+			if !errors.Is(fromParent.Error, tt.wantError) || !errors.Is(fromChild.Error, tt.wantError) {
+				t.Fatalf("errors: parent=%v child=%v, want %v", fromParent.Error, fromChild.Error, tt.wantError)
+			}
+			if tt.wantError != nil {
+				if fromParent.Project != "" || fromParent.Source == SourceGitChild || fromParent.Warning != "" {
+					t.Fatalf("false promotion success: %+v", fromParent)
+				}
+				return
+			}
+			if fromParent.Project != tt.want || fromChild.Project != tt.want || fromParent.Source != SourceGitChild || fromParent.Warning == "" || canonicalizePath(fromParent.Path) != canonicalizePath(child) {
+				t.Fatalf("parent=%+v child=%+v, want %q and child provenance", fromParent, fromChild, tt.want)
+			}
+		})
+	}
+}
+
 // TestDetectProjectFull_Case4_MultiChild asserts Error==ErrAmbiguousProject,
 // len(AvailableProjects)==2, Project=="" for two git-repo children (REQ-304).
 func TestDetectProjectFull_Case4_MultiChild(t *testing.T) {
@@ -587,6 +801,78 @@ func TestDetectProjectFull_Case4_MultiChild(t *testing.T) {
 	}
 }
 
+func TestDetectProjectFull_AmbiguousChildrenPreserveSeparatorForms(t *testing.T) {
+	tests := []struct {
+		name     string
+		children []string
+		want     []string
+	}{
+		{
+			name:     "repeated hyphens remain distinct",
+			children: []string{"Foo--Bar", "Foo-Bar"},
+			want:     []string{"foo--bar", "foo-bar"},
+		},
+		{
+			name:     "repeated underscores remain distinct",
+			children: []string{"Repo_Exact_B", "Repo__Exact__B"},
+			want:     []string{"repo_exact_b", "repo__exact__b"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := t.TempDir()
+			for _, name := range tt.children {
+				child := filepath.Join(parent, name)
+				if err := os.MkdirAll(child, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				initGit(t, child)
+			}
+
+			res := DetectProjectFull(parent)
+			if !errors.Is(res.Error, ErrAmbiguousProject) {
+				t.Fatalf("error = %v, want ErrAmbiguousProject", res.Error)
+			}
+			got := append([]string(nil), res.AvailableProjects...)
+			want := append([]string(nil), tt.want...)
+			sort.Strings(got)
+			sort.Strings(want)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("available projects = %q, want %q", res.AvailableProjects, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetectProjectFull_ChildScanFindsLaterSecondRepository(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"a-repo", "z-repo"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initGit(t, child)
+	}
+	for i := 1; i <= 25; i++ {
+		if err := os.Mkdir(filepath.Join(parent, fmt.Sprintf("noise-%02d", i)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	previousNow := childScanNow
+	childScanNow = func() time.Time { return time.Unix(0, 0) }
+	t.Cleanup(func() { childScanNow = previousNow })
+
+	res := DetectProjectFull(parent)
+
+	if !errors.Is(res.Error, ErrAmbiguousProject) {
+		t.Fatalf("result error = %v, want ErrAmbiguousProject", res.Error)
+	}
+	if !reflect.DeepEqual(res.AvailableProjects, []string{"a-repo", "z-repo"}) {
+		t.Fatalf("available projects = %q, want both repositories", res.AvailableProjects)
+	}
+}
+
 // TestDetectProjectFull_Case5_Basename asserts Source=="dir_basename",
 // Project==filepath.Base(dir), Error==nil for a plain non-git dir (REQ-305).
 func TestDetectProjectFull_Case5_Basename(t *testing.T) {
@@ -609,6 +895,217 @@ func TestDetectProjectFull_Case5_Basename(t *testing.T) {
 	}
 	if res.Warning != "" {
 		t.Errorf("Warning must be empty for dir_basename, got %q", res.Warning)
+	}
+}
+
+func TestDetectProjectFull_BasenameCanonicalizesRepeatedSeparators(t *testing.T) {
+	plain := filepath.Join(t.TempDir(), "Foo--Bar__Baz")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res := DetectProjectFull(plain)
+	if res.Source != SourceDirBasename || res.Project != "foo-bar_baz" {
+		t.Fatalf("basename detection = %+v, want source=%q project=%q", res, SourceDirBasename, "foo-bar_baz")
+	}
+}
+
+func TestFallbackProjectName_RootIsUnknown(t *testing.T) {
+	for _, dir := range []string{string(filepath.Separator), `C:\`} {
+		if got := fallbackProjectName(dir); got != "unknown" {
+			t.Fatalf("fallbackProjectName(%q) = %q, want unknown", dir, got)
+		}
+	}
+}
+
+func TestNormalize_PathValueIsUnknown(t *testing.T) {
+	for _, name := range []string{"invalid/path", `invalid\path`} {
+		if got := normalize(name); got != "unknown" {
+			t.Fatalf("normalize(%q) = %q, want unknown", name, got)
+		}
+	}
+}
+
+func TestDetectProjectFull_WorktreeUsesPrimaryRepositoryIdentity(t *testing.T) {
+	parent := t.TempDir()
+	repo := filepath.Join(parent, "canonical-repo")
+	worktree := filepath.Join(parent, "feature-worktree")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, repo)
+	commitEmptyGit(t, repo)
+	addGitWorktree(t, repo, worktree, "feature")
+
+	for _, dir := range []string{repo, worktree} {
+		res := DetectProjectFull(dir)
+		if res.Source != SourceGitRoot {
+			t.Errorf("DetectProjectFull(%q) source = %q, want %q", dir, res.Source, SourceGitRoot)
+		}
+		if res.Project != "canonical-repo" {
+			t.Errorf("DetectProjectFull(%q) project = %q, want canonical-repo", dir, res.Project)
+		}
+		if got, want := canonicalizePath(res.Path), canonicalizePath(repo); got != want {
+			t.Errorf("DetectProjectFull(%q) path = %q, want primary repository %q", dir, got, want)
+		}
+	}
+}
+
+func TestRuntimeWorktreeDirectoryKeepsLinkedWorktreesDistinct(t *testing.T) {
+	parent := t.TempDir()
+	primary := filepath.Join(parent, "primary")
+	sibling := filepath.Join(parent, "sibling")
+	if err := os.MkdirAll(primary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, primary)
+	commitEmptyGit(t, primary)
+	addGitWorktree(t, primary, sibling, "sibling")
+	if err := os.MkdirAll(filepath.Join(sibling, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	primaryDirectory := RuntimeWorktreeDirectory(primary)
+	siblingDirectory := RuntimeWorktreeDirectory(filepath.Join(sibling, "nested"))
+	if primaryDirectory != runtimeCanonicalizePath(primary) {
+		t.Fatalf("primary runtime directory = %q, want %q", primaryDirectory, runtimeCanonicalizePath(primary))
+	}
+	if siblingDirectory != runtimeCanonicalizePath(sibling) {
+		t.Fatalf("sibling runtime directory = %q, want %q", siblingDirectory, runtimeCanonicalizePath(sibling))
+	}
+	if primaryDirectory == siblingDirectory {
+		t.Fatalf("linked worktree runtime directories collapsed to %q", primaryDirectory)
+	}
+}
+
+func TestRuntimeWorktreeDirectoryNormalizesCaseOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only path case normalization")
+	}
+	dir := filepath.Join(t.TempDir(), "CaseSensitive")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, dir)
+
+	actual := RuntimeWorktreeDirectory(dir)
+	equivalent := RuntimeWorktreeDirectory(strings.ToLower(dir))
+	if equivalent != actual {
+		t.Fatalf("case-equivalent worktree directory = %q, want %q", equivalent, actual)
+	}
+}
+
+func TestRuntimeWorktreeDirectoryFallsBackToNonGitDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	if got, want := RuntimeWorktreeDirectory("."), runtimeCanonicalizePath(dir); got != want {
+		t.Fatalf("non-Git runtime directory = %q, want %q", got, want)
+	}
+}
+
+func TestRuntimeWorktreeDirectoryUsesCurrentDirectoryForWhitespaceInput(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	if got, want := RuntimeWorktreeDirectory(" \t "), runtimeCanonicalizePath(dir); got != want {
+		t.Fatalf("whitespace runtime directory = %q, want %q", got, want)
+	}
+}
+
+func TestDetectProjectFull_WorktreeRemoteUsesPrimaryRepositoryPath(t *testing.T) {
+	parent := t.TempDir()
+	repo := filepath.Join(parent, "canonical-repo")
+	worktree := filepath.Join(parent, "feature-worktree")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, repo)
+	commitEmptyGit(t, repo)
+	cmd := exec.Command("git", "-C", repo, "remote", "add", "origin", "git@github.com:test/canonical-remote.git")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+	addGitWorktree(t, repo, worktree, "feature")
+
+	res := DetectProjectFull(worktree)
+	if res.Source != SourceGitRemote || res.Project != "canonical-remote" {
+		t.Fatalf("worktree result = %+v, want git_remote canonical-remote", res)
+	}
+	if got, want := canonicalizePath(res.Path), canonicalizePath(repo); got != want {
+		t.Fatalf("worktree path = %q, want primary repository %q", got, want)
+	}
+}
+
+func TestDetectProjectFull_SubmoduleUsesCheckoutRoot(t *testing.T) {
+	parent := t.TempDir()
+	dependency := filepath.Join(parent, "dependency")
+	repo := filepath.Join(parent, "parent-repo")
+	for _, dir := range []string{dependency, repo} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initGit(t, dir)
+		commitEmptyGit(t, dir)
+	}
+	submodule := filepath.Join(repo, "deps", "submodule")
+	cmd := exec.Command("git", "-C", repo, "-c", "protocol.file.allow=always", "submodule", "add", dependency, "deps/submodule")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git submodule add: %v\n%s", err, out)
+	}
+
+	res := DetectProjectFull(submodule)
+	if res.Error != nil {
+		t.Fatalf("submodule result error = %v", res.Error)
+	}
+	if got, want := canonicalizePath(res.Path), canonicalizePath(submodule); got != want {
+		t.Fatalf("submodule path = %q, want checkout root %q", got, want)
+	}
+}
+
+func TestDetectProjectFull_BareRepositoryUsesRepositoryName(t *testing.T) {
+	parent := t.TempDir()
+	bare := filepath.Join(parent, "canonical-repo.git")
+	cmd := exec.Command("git", "init", "--bare", bare)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+
+	res := DetectProjectFull(bare)
+	if res.Source != SourceGitRoot || res.Project != "canonical-repo" {
+		t.Fatalf("bare repository result = %+v, want git-root canonical-repo", res)
+	}
+	canonicalParent := canonicalizePath(parent)
+	if got, want := canonicalizePath(res.Path), filepath.Join(canonicalParent, "canonical-repo"); got != want {
+		t.Fatalf("bare repository path = %q, want %q", got, want)
+	}
+}
+
+func TestDetectProjectFull_WorktreeDoesNotInheritCommonAncestorConfig(t *testing.T) {
+	parent := t.TempDir()
+	configDir := filepath.Join(parent, ".engram")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"project_name":"ancestor-leak"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(parent, "canonical-repo")
+	worktree := filepath.Join(parent, "feature-worktree")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, repo)
+	commitEmptyGit(t, repo)
+	addGitWorktree(t, repo, worktree, "feature")
+	nested := filepath.Join(worktree, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res := DetectProjectFull(nested)
+	if res.Source != SourceGitRoot || res.Project != "canonical-repo" {
+		t.Fatalf("worktree result = %+v, want primary git-root identity", res)
 	}
 }
 
@@ -688,25 +1185,29 @@ func TestChildScan_SkipHidden(t *testing.T) {
 	}
 }
 
-// TestDetectProject_MatchesFull asserts DetectProject returns same as
-// DetectProjectFull.Project for non-ambiguous cases (REQ-307 backward-compat wrapper).
-func TestDetectProject_MatchesFull(t *testing.T) {
+// TestDetectProjectFull_MatchesDefaultOptions asserts the default API and the
+// options-bearing API return the same established identity and provenance.
+func TestDetectProjectFull_MatchesDefaultOptions(t *testing.T) {
 	dir := t.TempDir()
 	initGit(t, dir)
 
 	full := DetectProjectFull(dir)
-	compat := DetectProject(dir)
-
-	// For non-ambiguous cases, the wrapper must match Full.Project.
-	if full.Error == nil && compat != full.Project {
-		t.Errorf("DetectProject = %q; DetectProjectFull.Project = %q; must be equal",
-			compat, full.Project)
+	if full.Error != nil {
+		t.Fatal(full.Error)
+	}
+	withOptions := DetectProjectFullWithOptions(dir, DetectionOptions{})
+	if withOptions.Error != nil {
+		t.Fatal(withOptions.Error)
+	}
+	if !reflect.DeepEqual(full, withOptions) {
+		t.Errorf("DetectProjectFull = %+v; default options = %+v; must be equal",
+			full, withOptions)
 	}
 }
 
-// TestDetectProject_AmbiguousEmpty asserts DetectProject returns basename
-// (not empty) even on ambiguous cwd, maintaining CLI compat (REQ-307).
-func TestDetectProject_AmbiguousEmpty(t *testing.T) {
+// TestDetectProjectFull_AmbiguousNoImplicitFallback asserts an ambiguous cwd
+// keeps its actionable error and choices rather than inventing a basename scope.
+func TestDetectProjectFull_AmbiguousNoImplicitFallback(t *testing.T) {
 	parent := t.TempDir()
 	for _, name := range []string{"repo-a", "repo-b"} {
 		child := filepath.Join(parent, name)
@@ -716,19 +1217,145 @@ func TestDetectProject_AmbiguousEmpty(t *testing.T) {
 		initGit(t, child)
 	}
 
-	// DetectProjectFull reports ambiguous — Project will be "".
 	full := DetectProjectFull(parent)
 	if !errors.Is(full.Error, ErrAmbiguousProject) {
-		t.Skipf("expected ambiguous; got source=%s err=%v", full.Source, full.Error)
+		t.Fatalf("expected ambiguous; got source=%s err=%v", full.Source, full.Error)
+	}
+	if full.Project != "" || full.Source != SourceAmbiguous {
+		t.Fatalf("ambiguous cwd must not acquire an implicit identity: %+v", full)
+	}
+	if !reflect.DeepEqual(full.AvailableProjects, []string{"repo-a", "repo-b"}) {
+		t.Fatalf("expected actionable project choices: %v", full.AvailableProjects)
+	}
+}
+
+func TestDetectProjectFull_AmbiguousChildrenStableOrder(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"repo-a", "repo-b"} {
+		if err := os.MkdirAll(filepath.Join(parent, name, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		entries []os.DirEntry
+	}{
+		{name: "forward", entries: entries},
+		{name: "reversed", entries: []os.DirEntry{entries[1], entries[0]}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldReadDir, oldNow := childScanReadDir, childScanNow
+			t.Cleanup(func() {
+				childScanReadDir = oldReadDir
+				childScanNow = oldNow
+			})
+			base := time.Date(2026, time.August, 28, 0, 0, 0, 0, time.UTC)
+			childScanNow = func() time.Time { return base }
+			reads := 0
+			childScanReadDir = func(_ *os.File, count int) ([]os.DirEntry, error) {
+				if count != 1 {
+					t.Fatalf("ReadDir count = %d, want 1", count)
+				}
+				if reads == len(tc.entries) {
+					t.Fatal("child scan continued after the second repository")
+					return nil, io.EOF
+				}
+				entry := tc.entries[reads]
+				reads++
+				return []os.DirEntry{entry}, nil
+			}
+
+			res := DetectProjectFull(parent)
+			if !errors.Is(res.Error, ErrAmbiguousProject) {
+				t.Fatalf("Error = %v, want ErrAmbiguousProject", res.Error)
+			}
+			if want := []string{"repo-a", "repo-b"}; !reflect.DeepEqual(res.AvailableProjects, want) {
+				t.Fatalf("AvailableProjects = %q, want %q", res.AvailableProjects, want)
+			}
+			if reads != 2 {
+				t.Fatalf("ReadDir calls = %d, want 2", reads)
+			}
+		})
+	}
+}
+
+func TestChildScan_ContinuesPastNoiseUntilSecondRepository(t *testing.T) {
+	parent := t.TempDir()
+	firstRepo := filepath.Join(parent, "01-repo")
+	if err := os.MkdirAll(filepath.Join(firstRepo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		if err := os.Mkdir(filepath.Join(parent, fmt.Sprintf("%02d-plain", i+2)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secondRepo := filepath.Join(parent, "zz-repo")
+	if err := os.MkdirAll(filepath.Join(secondRepo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 
-	// The design decision: on ambiguity, DetectProject returns basename fallback
-	// so CLI callers never see empty. We verify project != "" per design doc §9.
-	// NOTE: the spec says DetectProject returns full.Project; design says ambiguous
-	// populates Project with basename. Both are satisfied by DetectProjectFull
-	// setting Project=basename when ErrAmbiguousProject occurs.
-	got := DetectProject(parent)
-	if got == "" {
-		t.Error("DetectProject must not return empty string on ambiguous cwd")
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(entries), 27; got != want {
+		t.Fatalf("fixture entries = %d, want %d", got, want)
+	}
+	oldReadDir := childScanReadDir
+	t.Cleanup(func() { childScanReadDir = oldReadDir })
+	reads := 0
+	childScanReadDir = func(_ *os.File, count int) ([]os.DirEntry, error) {
+		if count != 1 {
+			t.Fatalf("ReadDir count = %d, want 1", count)
+		}
+		if reads == len(entries) {
+			return nil, io.EOF
+		}
+		entry := entries[reads]
+		reads++
+		return []os.DirEntry{entry}, nil
+	}
+
+	repos, timedOut := scanChildren(parent)
+	if timedOut {
+		t.Fatal("bounded scan unexpectedly timed out")
+	}
+	if got, want := reads, len(entries); got != want {
+		t.Fatalf("ReadDir calls = %d, want all %d entries through the second repository", got, want)
+	}
+	if got, want := repos, []string{firstRepo, secondRepo}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("repos = %q, want both repositories %q", got, want)
+	}
+}
+
+func TestChildScan_TimeoutFallsBackWithoutStartingReads(t *testing.T) {
+	parent := t.TempDir()
+	oldNow, oldReadDir := childScanNow, childScanReadDir
+	t.Cleanup(func() {
+		childScanNow = oldNow
+		childScanReadDir = oldReadDir
+	})
+	base := time.Date(2026, time.August, 28, 0, 0, 0, 0, time.UTC)
+	clockCalls := 0
+	childScanNow = func() time.Time {
+		clockCalls++
+		if clockCalls == 1 {
+			return base
+		}
+		return base.Add(childScanTimeout + time.Nanosecond)
+	}
+	childScanReadDir = func(_ *os.File, _ int) ([]os.DirEntry, error) {
+		t.Fatal("child scan read after its deadline")
+		return nil, io.EOF
+	}
+
+	res := DetectProjectFull(parent)
+	if res.Source != SourceDirBasename || res.Error != nil {
+		t.Fatalf("timeout result = %+v, want dir_basename fallback", res)
 	}
 }

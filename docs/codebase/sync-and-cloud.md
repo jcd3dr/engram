@@ -28,7 +28,15 @@ Local SQLite
 
 `internal/sync/sync.go` avoids one large shared JSON file. Each sync creates new chunks and a small manifest. That reduces merge conflicts and lets multiple machines generate memory in parallel.
 
-Project-scoped chunks carry sessions, observations, prompts, and the non-orphaned `memory_relations` graph for observations in that project. Relation rows travel as existing `relation` sync mutations inside the chunk so imports reuse the same idempotent relation apply path as cloud sync.
+Project-scoped Git chunks carry sessions, observations, and the non-orphaned `memory_relations` graph for observations in that project. **Prompts are excluded by default**, including previously imported prompts. Intentional sharing requires `engram sync --include-prompts`; the core API is `ExportWithOptions` with `GitExportOptions{IncludePrompts: true}`. Relation rows travel as existing `relation` sync mutations inside the chunk so imports reuse the same idempotent relation apply path as cloud sync.
+
+Prompt exclusion happens before serialization, hashing, and counting, without changing local SQLite data. Prompt-delete tombstones still travel: they share identity and deletion metadata, not prompt content. Cloud replication and standalone `engram export` retain their existing prompt behavior; the Git opt-in option is rejected in cloud mode before effects. Import remains compatible with historical prompt-bearing chunks.
+
+During incremental local project exports, an observation absent from available chunk history bypasses the manifest watermark. A direct historical row or an observation mutation, including a tombstone, establishes historical presence. Opt-in prompts use stable-ID presence in available history, not their creation timestamps: prompts omitted by earlier exports remain eligible even after other memories advance the watermark. Both legacy prompt arrays and prompt mutations establish presence; tombstoned identities remain suppressed. Repeated opt-in does not resend those identities. Sessions retain timestamp filtering, but parents needed by emitted observations or prompts are included once per chunk for dependency closure.
+
+This is not redaction: observations and other shared fields can still contain sensitive data. Inspect chunks before committing. Existing chunks are never rewritten, and excluding prompts now does not remove content already retained in Git history.
+
+Cloud exports are size-bounded: `engram sync --cloud` splits the pending mutation replay into deterministic, dependency-complete chunks of at most 4 MiB each, so a large initial replay stays within the server's `ENGRAM_CLOUD_MAX_PUSH_BYTES` limit (default 8 MiB). Each chunk acknowledges only its own mutation sequences after a successful push, so an interrupted sync resumes from the first unacknowledged mutation instead of replaying acknowledged work.
 
 Guardrails:
 
@@ -48,6 +56,96 @@ Guardrails:
 - degraded state with `reason_code` and message.
 
 Business rule: **if sync is blocked, fail loudly and visibly**. No silent drops.
+
+### Blank session identities
+
+A session identity is blank when `strings.TrimSpace` reduces it to the empty
+string. That is the only definition. SQL predicates express it through the
+shared whitespace trim set in `internal/store/store.go` (`sqlSessionIDBlank` /
+`sqlSessionIDNotBlank`), because SQLite's bare `trim()` strips only `U+0020` and
+would otherwise let a tab- or newline-only legacy ID be blank to Go and
+non-blank to SQL.
+
+Local writes fail closed. `enqueueSyncMutationTx` rejects a blank session
+identity for every caller, so no blank-identity mutation can enter the journal
+regardless of which Store method enqueues it.
+
+Pulled mutations are **skip-plus-evidence**, not fail-closed. Servers enrolled
+before the identity rule existed still hold historical chunks whose session
+identity is blank. No local action can make those valid, so halting the pull
+would pin the cursor forever and block every later mutation behind it. Instead
+the mutation is quarantined in `sync_apply_deferred` with reason code
+`sync_session_identity_invalid`, the rest of the chunk applies, and the cursor
+advances. A payload that does not decode at all stays fail-closed — that is a
+transport fault, not known-corrupt historical data.
+
+Quarantined mutations are never silent, so the "no silent drops" rule holds:
+`engram doctor --check invalid_session_identity` reports each one as a warning
+finding with reason code `quarantined_pulled_session_identity`, and `engram
+conflicts deferred` lists the raw row. The same doctor check reports blank
+identities found in the local `sessions` table as blocking findings. Neither is
+auto-repaired, because inventing a canonical session ID would fabricate identity
+data.
+
+### Session directory admission: local-partial, cloud ownership-aware, cloud-mutation-compatible
+
+Session `directory` follows a two-domain contract (engram#1287), with one Cloud
+compatibility exception for historical per-mutation events.
+
+**Local pulled chunks admit a partial directory.** The local validator accepts
+only two states: the `directory` key is absent, or its value is a JSON string
+(blank/whitespace included). JSON `null` and every non-string token are rejected
+with `ErrPulledSessionDirectoryInvalid` — `null` is not a blank directory, it is
+a non-string value and never normalizes into one.
+
+**Cloud pulled chunks require a concrete directory for shared and legacy
+sessions.** A blank or missing directory fails their chunk atomically: no
+session is persisted, the chunk is not recorded as imported, and the corrected
+chunk can be redelivered.
+
+**Project-owned sessions may omit the directory or carry a blank string.**
+Isolated cross-project registrations intentionally have no directory; cloud
+push, pull, mutation canonicalization, and doctor preserve that state and the
+`ownership_mode: "project_owned"` field. JSON null and non-string directory
+values remain invalid. This also applies to `Store.ApplyPulledMutation`, the
+single-mutation path used by cloud autosync. No fabricated directory or manual
+database repair is needed for an isolated session.
+
+**Cloud pulled mutations admit a blank or omitted directory.**
+`Store.ApplyPulledMutation`, the single-mutation path used by cloud autosync,
+accepts a session whose `directory` is a JSON string (blank or whitespace
+included) or absent, for every ownership mode, because historical Cloud
+session events carry both shapes. The session is applied as carried, as an
+inert partial session: no directory, `ended_at`, runtime lease, or owner is
+invented, a new row takes the default `shared` mode when the payload names
+none, and the cursor advances in the same transaction. JSON `null` and any
+non-string value are still rejected: nothing is persisted, nothing is
+dead-lettered, and the cursor does not advance. The completion upsert below
+still preserves an existing concrete directory and a `project_owned` owner.
+Because a new row is `shared`, isolated session registration refuses it with
+`session_isolation_conflict`.
+
+The domain is carried explicitly, never inferred from the target-key string:
+the syncer's import mode selects it, and it flows through
+`Store.ApplyPulledChunkForDomain(targetKey, chunkID, mutations, cloud)`.
+`Store.ApplyPulledChunk` remains the local-domain wrapper and
+`Store.ApplyPulledMutation` always uses the Cloud mutation rule;
+`chunkTrackingTargetKey` still controls scoping and dedup, but it is not a
+domain signal.
+
+**Completion, not overwrite.** Every path that can see an existing session —
+`createSessionTx`, `startSessionTx`, and the pulled-payload upsert — uses the
+same SQL CASE: an existing concrete directory is preserved, and a blank one
+adopts the incoming concrete value. A later blank payload never erases a
+concrete directory, and replayed chunks are idempotent for directory.
+
+**Snapshot import is identity-establishing, not completing.** `Store.Import`
+uses `INSERT OR IGNORE`: a later concrete duplicate does not complete an
+existing blank session — completion belongs to the create/start/pulled-chunk
+paths. At the JSON decode boundary (`ExportData.UnmarshalJSON`) an absent
+directory key is treated as blank and accepted, present strings are preserved
+verbatim, and `null` or any non-string token fails the whole unmarshal with an
+error naming the offending session.
 
 ## Cloud transport: `internal/cloud/remote` + `internal/cloud/cloudserver`
 

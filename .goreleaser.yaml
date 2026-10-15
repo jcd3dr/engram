@@ -2,10 +2,6 @@ version: 2
 
 project_name: engram
 
-before:
-  hooks:
-    - go mod tidy
-
 builds:
   - main: ./cmd/engram
     binary: engram

@@ -1,32 +1,37 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud"
-	"github.com/Gentleman-Programming/engram/internal/cloud/autosync"
-	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
-	"github.com/Gentleman-Programming/engram/internal/cloud/remote"
-	"github.com/Gentleman-Programming/engram/internal/mcp"
-	engramsrv "github.com/Gentleman-Programming/engram/internal/server"
-	"github.com/Gentleman-Programming/engram/internal/setup"
-	"github.com/Gentleman-Programming/engram/internal/store"
-	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
-	"github.com/Gentleman-Programming/engram/internal/tui"
-	versioncheck "github.com/Gentleman-Programming/engram/internal/version"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/autosync"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/constants"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/remote"
+	"github.com/Gentleman-Programming/engram/v3/internal/mcp"
+	engramsrv "github.com/Gentleman-Programming/engram/v3/internal/server"
+	"github.com/Gentleman-Programming/engram/v3/internal/setup"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/v3/internal/sync"
+	"github.com/Gentleman-Programming/engram/v3/internal/tui"
+	versioncheck "github.com/Gentleman-Programming/engram/v3/internal/version"
 
 	tea "github.com/charmbracelet/bubbletea"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -129,6 +134,108 @@ func stubExitWithPanic(t *testing.T) {
 	t.Cleanup(func() { exitFunc = old })
 }
 
+func TestMainDataDirEnvBlankUsesDefault(t *testing.T) {
+	stubExitWithPanic(t)
+
+	oldStoreDefaultConfig := storeDefaultConfig
+	t.Cleanup(func() { storeDefaultConfig = oldStoreDefaultConfig })
+
+	oldCheckForUpdates := checkForUpdates
+	checkForUpdates = func(string) versioncheck.CheckResult { return versioncheck.CheckResult{} }
+	t.Cleanup(func() { checkForUpdates = oldCheckForUpdates })
+
+	cwd := t.TempDir()
+	withCwd(t, cwd)
+
+	explicitDataDir := " explicit-data-dir "
+	if runtime.GOOS == "windows" {
+		// Windows does not preserve trailing spaces in directory names.
+		explicitDataDir = " explicit-data-dir"
+	}
+
+	tests := []struct {
+		name          string
+		unsetEnv      bool
+		envValue      string
+		createDataDir bool
+		wantDataDir   func(defaultDir string) string
+	}{
+		{
+			name:        "absent uses default",
+			unsetEnv:    true,
+			wantDataDir: func(defaultDir string) string { return defaultDir },
+		},
+		{
+			name:        "empty uses default",
+			envValue:    "",
+			wantDataDir: func(defaultDir string) string { return defaultDir },
+		},
+		{
+			name:        "whitespace only uses default",
+			envValue:    " \t\n ",
+			wantDataDir: func(defaultDir string) string { return defaultDir },
+		},
+		{
+			name:          "explicit path is preserved",
+			envValue:      explicitDataDir,
+			createDataDir: true,
+			wantDataDir:   func(string) string { return filepath.Join(cwd, explicitDataDir) },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			defaultDir := filepath.Join(t.TempDir(), "default")
+			storeDefaultConfig = func() (store.Config, error) {
+				return store.Config{DataDir: defaultDir}, nil
+			}
+
+			if tc.unsetEnv {
+				previous, wasSet := os.LookupEnv("ENGRAM_DATA_DIR")
+				if err := os.Unsetenv("ENGRAM_DATA_DIR"); err != nil {
+					t.Fatalf("unset ENGRAM_DATA_DIR: %v", err)
+				}
+				t.Cleanup(func() {
+					if wasSet {
+						_ = os.Setenv("ENGRAM_DATA_DIR", previous)
+						return
+					}
+					_ = os.Unsetenv("ENGRAM_DATA_DIR")
+				})
+			} else {
+				t.Setenv("ENGRAM_DATA_DIR", tc.envValue)
+			}
+
+			wantDataDir := tc.wantDataDir(defaultDir)
+			if tc.createDataDir {
+				if err := os.MkdirAll(wantDataDir, 0o755); err != nil {
+					t.Fatalf("create explicit data directory: %v", err)
+				}
+			}
+
+			withArgs(t, "engram", "instance-id")
+			stdout, stderr, recovered := captureOutputAndRecover(t, main)
+			if recovered != nil || stderr != "" {
+				t.Fatalf("instance-id should succeed, panic=%v stderr=%q", recovered, stderr)
+			}
+
+			id := strings.TrimSpace(stdout)
+			if len(id) != 32 {
+				t.Fatalf("instance ID length = %d, want 32: %q", len(id), id)
+			}
+			for _, char := range id {
+				if char < '0' || char > '9' && char < 'a' || char > 'f' {
+					t.Fatalf("instance ID = %q, want lowercase hex", id)
+				}
+			}
+
+			if _, err := os.Stat(filepath.Join(wantDataDir, ".instance-id")); err != nil {
+				t.Fatalf("instance ID file in expected data directory: %v", err)
+			}
+		})
+	}
+}
+
 func stubRuntimeHooks(t *testing.T) {
 	t.Helper()
 	oldStoreNew := storeNew
@@ -152,6 +259,7 @@ func stubRuntimeHooks(t *testing.T) {
 	oldJSONMarshalIndent := jsonMarshalIndent
 	oldSyncStatus := syncStatus
 	oldSyncImport := syncImport
+	oldSyncImportWithProgress := syncImportWithProgress
 	oldSyncExport := syncExport
 	oldNewCloudAutosyncManager := newCloudAutosyncManager
 	oldCheckForUpdates := checkForUpdates
@@ -192,6 +300,9 @@ func stubRuntimeHooks(t *testing.T) {
 		return sy.Status()
 	}
 	syncImport = func(sy *engramsync.Syncer) (*engramsync.ImportResult, error) { return sy.Import() }
+	syncImportWithProgress = func(sy *engramsync.Syncer, report func(engramsync.ImportProgress)) (*engramsync.ImportResult, error) {
+		return sy.ImportWithProgress(report)
+	}
 	syncExport = func(sy *engramsync.Syncer, createdBy, project string) (*engramsync.SyncResult, error) {
 		return sy.Export(createdBy, project)
 	}
@@ -225,6 +336,7 @@ func stubRuntimeHooks(t *testing.T) {
 		jsonMarshalIndent = oldJSONMarshalIndent
 		syncStatus = oldSyncStatus
 		syncImport = oldSyncImport
+		syncImportWithProgress = oldSyncImportWithProgress
 		syncExport = oldSyncExport
 		newCloudAutosyncManager = oldNewCloudAutosyncManager
 		checkForUpdates = oldCheckForUpdates
@@ -247,6 +359,45 @@ func TestFatal(t *testing.T) {
 	}
 }
 
+func TestCmdServeWiresBuildVersionIntoHealth(t *testing.T) {
+	cfg := testConfig(t)
+	stubRuntimeHooks(t)
+	withArgs(t, "engram", "serve")
+	t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "")
+
+	const buildVersion = "test-build-version"
+	oldVersion := version
+	version = buildVersion
+	t.Cleanup(func() { version = oldVersion })
+
+	checkedHealth := false
+	startHTTP = func(srv *engramsrv.Server) error {
+		req := httptest.NewRequest(http.MethodGet, "/health", nil)
+		res := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(res, req)
+
+		if res.Code != http.StatusOK {
+			t.Fatalf("health status=%d want=%d", res.Code, http.StatusOK)
+		}
+		var health struct {
+			Version string `json:"version"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&health); err != nil {
+			t.Fatalf("decode health response: %v", err)
+		}
+		if health.Version != buildVersion {
+			t.Fatalf("health version=%q want=%q", health.Version, buildVersion)
+		}
+		checkedHealth = true
+		return nil
+	}
+
+	cmdServe(cfg)
+	if !checkedHealth {
+		t.Fatal("cmdServe did not start the HTTP server")
+	}
+}
+
 func TestCmdServeParsesPortAndErrors(t *testing.T) {
 	cfg := testConfig(t)
 	stubRuntimeHooks(t)
@@ -258,18 +409,20 @@ func TestCmdServeParsesPortAndErrors(t *testing.T) {
 		wantPort  int
 		startErr  error
 		wantFatal bool
+		wantError string
 	}{
 		{name: "default port", wantPort: 7437},
 		{name: "env port", envPort: "8123", wantPort: 8123},
 		{name: "arg overrides env", envPort: "8123", argPort: "9001", wantPort: 9001},
 		{name: "invalid env keeps default", envPort: "nope", wantPort: 7437},
-		{name: "invalid arg keeps env", envPort: "8123", argPort: "bad", wantPort: 8123},
-		{name: "start failure", wantPort: 7437, startErr: errors.New("listen failed"), wantFatal: true},
+		{name: "invalid argument is rejected", envPort: "8123", argPort: "bad", wantPort: -1, wantFatal: true, wantError: "unknown serve argument"},
+		{name: "start failure", wantPort: 7437, startErr: errors.New("listen failed"), wantFatal: true, wantError: "listen failed"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			stubExitWithPanic(t)
+			t.Setenv("ENGRAM_SOCKET", "")
 			if tc.envPort != "" {
 				t.Setenv("ENGRAM_PORT", tc.envPort)
 			} else {
@@ -292,7 +445,9 @@ func TestCmdServeParsesPortAndErrors(t *testing.T) {
 			}
 
 			_, stderr, recovered := captureOutputAndRecover(t, func() {
-				cmdServe(cfg)
+				if err := cmdServe(cfg); err != nil {
+					fatal(err)
+				}
 			})
 
 			if seenPort != tc.wantPort {
@@ -302,8 +457,8 @@ func TestCmdServeParsesPortAndErrors(t *testing.T) {
 				if _, ok := recovered.(exitCode); !ok {
 					t.Fatalf("expected fatal exit, got %v", recovered)
 				}
-				if !strings.Contains(stderr, "listen failed") {
-					t.Fatalf("stderr missing start error: %q", stderr)
+				if !strings.Contains(stderr, tc.wantError) {
+					t.Fatalf("stderr missing expected error: %q", stderr)
 				}
 			} else if recovered != nil {
 				t.Fatalf("expected no panic, got %v", recovered)
@@ -456,11 +611,315 @@ func TestCmdServeStartsWithoutAutosync(t *testing.T) {
 // BR2-3: Stubs newAutosyncManager with a fully deterministic fake that has no
 // goroutines, no WaitGroup, and no real network calls — eliminating the racy
 // wg.Add/wg.Wait interleave that occurred when using the real *autosync.Manager.
+func TestCmdServeGenerationChangeStopsAutosyncAndReturnsTerminalError(t *testing.T) {
+	run, ok := any(cmdServe).(func(store.Config) error)
+	if !ok {
+		t.Fatal("cmdServe cannot return a terminal cause after cleanup")
+	}
+	stubRuntimeHooks(t)
+	withArgs(t, "engram", "serve")
+	t.Setenv("ENGRAM_SOCKET", "")
+	t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "1")
+	t.Setenv("ENGRAM_CLOUD_TOKEN", "test-token")
+	t.Setenv("ENGRAM_CLOUD_SERVER", "https://localhost:9999")
+	oldManager := newAutosyncManager
+	t.Cleanup(func() { newAutosyncManager = oldManager })
+	var stopped atomic.Int32
+	ctxSeen := make(chan context.Context, 1)
+	newAutosyncManager = func(*store.Store, autosync.CloudTransport, autosync.Config) startableAutosyncManager {
+		return &fakeStartableManager{runFn: func(ctx context.Context) { ctxSeen <- ctx }, stopFn: func() { stopped.Add(1) }}
+	}
+	oldNotify := serveGenerationInvalidated
+	t.Cleanup(func() { serveGenerationInvalidated = oldNotify })
+	notification := make(chan struct{}, 1)
+	serveGenerationInvalidated = func(*engramsrv.Server) <-chan struct{} { return notification }
+	startHTTP = func(*engramsrv.Server) error { notification <- struct{}{}; return nil }
+	var diagnostic bytes.Buffer
+	oldLog := log.Writer()
+	log.SetOutput(&diagnostic)
+	t.Cleanup(func() { log.SetOutput(oldLog) })
+	cfg := testConfig(t)
+	var opened *store.Store
+	storeNew = func(cfg store.Config) (*store.Store, error) {
+		var err error
+		opened, err = store.New(cfg)
+		return opened, err
+	}
+	err := run(cfg)
+	if _, err := opened.Stats(); err == nil {
+		t.Fatal("store not closed before return")
+	}
+	const message = "[engram] database generation changed; stopping server; restart Engram"
+	if strings.Count(diagnostic.String(), message) != 1 || strings.Contains(diagnostic.String(), cfg.DataDir) {
+		t.Fatalf("unsafe or duplicate diagnostic: %q", diagnostic.String())
+	}
+	if !errors.Is(err, store.ErrDatabaseGenerationChanged) {
+		t.Fatalf("terminal cause = %v", err)
+	}
+	if stopped.Load() != 1 {
+		t.Fatalf("stop calls = %d", stopped.Load())
+	}
+	select {
+	case <-(<-ctxSeen).Done():
+	default:
+		t.Fatal("autosync context not canceled before return")
+	}
+}
+
+// This accessor seam proves owner consultation before store close, not a blocked
+// handler integration or real store invalidation. The notification stays empty.
+func TestCmdServeStickyGenerationWithoutNotification(t *testing.T) {
+	for _, trigger := range []string{"signal", "serve_error", "serve_nil"} {
+		for _, state := range []string{"sticky", "nil", "transient"} {
+			t.Run(trigger+"/"+state, func(t *testing.T) {
+				stubRuntimeHooks(t)
+				withArgs(t, "engram", "serve")
+				t.Setenv("ENGRAM_SOCKET", "")
+				t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "1")
+				t.Setenv("ENGRAM_CLOUD_TOKEN", "test-token")
+				t.Setenv("ENGRAM_CLOUD_SERVER", "https://localhost:9999")
+				oldManager, oldGeneration := newAutosyncManager, serveGenerationInvalidated
+				oldAccessor, oldNotify, oldStop := serveGenerationError, notifySignals, stopSignals
+				t.Cleanup(func() {
+					newAutosyncManager, serveGenerationInvalidated = oldManager, oldGeneration
+					serveGenerationError, notifySignals, stopSignals = oldAccessor, oldNotify, oldStop
+				})
+				notification := make(chan struct{})
+				serveGenerationInvalidated = func(*engramsrv.Server) <-chan struct{} { return notification }
+				notifySignals = func(ch chan<- os.Signal, _ ...os.Signal) {
+					if trigger == "signal" {
+						ch <- syscall.SIGTERM
+					}
+				}
+				stopSignals = func(chan<- os.Signal) {}
+				var original error
+				if trigger == "serve_error" {
+					original = errors.New("serving loop failed")
+				}
+				release, serverDone := make(chan struct{}), make(chan struct{})
+				startHTTP = func(*engramsrv.Server) error {
+					defer close(serverDone)
+					if trigger == "signal" {
+						<-release
+					}
+					return original
+				}
+				var stopped, reads int
+				var observed error
+				newAutosyncManager = func(*store.Store, autosync.CloudTransport, autosync.Config) startableAutosyncManager {
+					return &fakeStartableManager{stopFn: func() {
+						stopped++
+						switch state {
+						case "sticky":
+							observed = fmt.Errorf("private fixture detail: %w", store.ErrDatabaseGenerationChanged)
+						case "transient":
+							observed = errors.New("private transient fixture detail")
+						}
+						close(release)
+					}}
+				}
+				serveGenerationError = func(s *store.Store) error {
+					reads++
+					if stopped != 1 {
+						t.Fatal("sticky accessor consulted before background cleanup")
+					}
+					if _, err := s.Stats(); err != nil {
+						t.Fatalf("store closed before sticky accessor: %v", err)
+					}
+					return observed
+				}
+				var diagnostic bytes.Buffer
+				oldLog := log.Writer()
+				log.SetOutput(&diagnostic)
+				t.Cleanup(func() { log.SetOutput(oldLog) })
+				var opened *store.Store
+				storeNew = func(cfg store.Config) (*store.Store, error) {
+					var err error
+					opened, err = store.New(cfg)
+					return opened, err
+				}
+				err := cmdServe(testConfig(t))
+				<-serverDone
+				if _, err := opened.Stats(); err == nil {
+					t.Fatal("store not closed before return")
+				}
+				want, count := original, 0
+				if state == "sticky" {
+					want, count = store.ErrDatabaseGenerationChanged, 1
+				}
+				if err != want {
+					t.Fatalf("terminal cause = %v, want %v", err, want)
+				}
+				if reads != 1 || stopped != 1 {
+					t.Fatalf("accessor reads = %d, Stop calls = %d, want 1 each", reads, stopped)
+				}
+				const message = "[engram] database generation changed; stopping server; restart Engram"
+				if strings.Count(diagnostic.String(), message) != count || strings.Contains(diagnostic.String(), "private") {
+					t.Fatalf("diagnostic = %q, want %d privacy-safe generation messages", diagnostic.String(), count)
+				}
+			})
+		}
+	}
+}
+
+func TestCmdServeResultShutdownGenerationPrecedence(t *testing.T) {
+	for _, generation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("late_generation=%t", generation), func(t *testing.T) {
+			stubRuntimeHooks(t)
+			withArgs(t, "engram", "serve")
+			t.Setenv("ENGRAM_SOCKET", "")
+			t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "1")
+			t.Setenv("ENGRAM_CLOUD_TOKEN", "test-token")
+			t.Setenv("ENGRAM_CLOUD_SERVER", "https://localhost:9999")
+			oldManager, oldGeneration := newAutosyncManager, serveGenerationInvalidated
+			oldNotify, oldStop := notifySignals, stopSignals
+			t.Cleanup(func() {
+				newAutosyncManager, serveGenerationInvalidated = oldManager, oldGeneration
+				notifySignals, stopSignals = oldNotify, oldStop
+			})
+			notification := make(chan struct{}, 1)
+			serveGenerationInvalidated = func(*engramsrv.Server) <-chan struct{} { return notification }
+			notifySignals = func(chan<- os.Signal, ...os.Signal) {}
+			stopSignals = func(chan<- os.Signal) {}
+			serveErr := errors.New("serving loop failed")
+			startHTTP = func(*engramsrv.Server) error { return serveErr }
+			ctxSeen := make(chan context.Context, 1)
+			var stopped int
+			newAutosyncManager = func(*store.Store, autosync.CloudTransport, autosync.Config) startableAutosyncManager {
+				return &fakeStartableManager{
+					runFn: func(ctx context.Context) { ctxSeen <- ctx },
+					stopFn: func() {
+						stopped++
+						// Only serveResult is ready; invalidation arrives during cleanup.
+						if generation {
+							notification <- struct{}{}
+						}
+					},
+				}
+			}
+			cfg := testConfig(t)
+			var opened *store.Store
+			storeNew = func(cfg store.Config) (*store.Store, error) {
+				var err error
+				opened, err = store.New(cfg)
+				return opened, err
+			}
+			var diagnostic bytes.Buffer
+			oldLog := log.Writer()
+			log.SetOutput(&diagnostic)
+			t.Cleanup(func() { log.SetOutput(oldLog) })
+			err := cmdServe(cfg)
+			if stopped != 1 {
+				t.Fatalf("Stop calls = %d, want 1", stopped)
+			}
+			select {
+			case <-(<-ctxSeen).Done():
+			default:
+				t.Fatal("background context not canceled before return")
+			}
+			if _, err := opened.Stats(); err == nil {
+				t.Fatal("store not closed before return")
+			}
+			wantErr := serveErr
+			wantDiagnostics := 0
+			if generation {
+				wantErr = store.ErrDatabaseGenerationChanged
+				wantDiagnostics = 1
+			}
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("terminal cause = %v, want %v", err, wantErr)
+			}
+			const message = "[engram] database generation changed; stopping server; restart Engram"
+			if strings.Count(diagnostic.String(), message) != wantDiagnostics {
+				t.Fatalf("diagnostic = %q, want count %d", diagnostic.String(), wantDiagnostics)
+			}
+		})
+	}
+}
+
+func TestCmdServeSignalShutdownGenerationPrecedence(t *testing.T) {
+	for _, generation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("late_generation=%t", generation), func(t *testing.T) {
+			stubRuntimeHooks(t)
+			withArgs(t, "engram", "serve")
+			t.Setenv("ENGRAM_SOCKET", "")
+			t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "1")
+			t.Setenv("ENGRAM_CLOUD_TOKEN", "test-token")
+			t.Setenv("ENGRAM_CLOUD_SERVER", "https://localhost:9999")
+			oldManager, oldGeneration := newAutosyncManager, serveGenerationInvalidated
+			oldNotify, oldStop := notifySignals, stopSignals
+			t.Cleanup(func() {
+				newAutosyncManager, serveGenerationInvalidated = oldManager, oldGeneration
+				notifySignals, stopSignals = oldNotify, oldStop
+			})
+			notification := make(chan struct{}, 1)
+			serveGenerationInvalidated = func(*engramsrv.Server) <-chan struct{} { return notification }
+			notifySignals = func(ch chan<- os.Signal, _ ...os.Signal) { ch <- syscall.SIGTERM }
+			stopSignals = func(chan<- os.Signal) {}
+			release, serverDone := make(chan struct{}), make(chan struct{})
+			startHTTP = func(*engramsrv.Server) error { defer close(serverDone); <-release; return nil }
+			ctxSeen := make(chan context.Context, 1)
+			var stopped atomic.Int32
+			newAutosyncManager = func(*store.Store, autosync.CloudTransport, autosync.Config) startableAutosyncManager {
+				return &fakeStartableManager{
+					runFn: func(ctx context.Context) { ctxSeen <- ctx },
+					stopFn: func() {
+						stopped.Add(1)
+						// Only signal selection can reach Stop: both other select cases remain blocked.
+						if generation {
+							notification <- struct{}{}
+						}
+						close(release)
+					},
+				}
+			}
+			cfg := testConfig(t)
+			var opened *store.Store
+			storeNew = func(cfg store.Config) (*store.Store, error) {
+				var err error
+				opened, err = store.New(cfg)
+				return opened, err
+			}
+			var diagnostic bytes.Buffer
+			oldLog := log.Writer()
+			log.SetOutput(&diagnostic)
+			t.Cleanup(func() { log.SetOutput(oldLog) })
+			err := cmdServe(cfg)
+			<-serverDone
+			if stopped.Load() != 1 {
+				t.Fatalf("Stop calls = %d, want 1", stopped.Load())
+			}
+			select {
+			case <-(<-ctxSeen).Done():
+			default:
+				t.Fatal("background context not canceled")
+			}
+			if _, err := opened.Stats(); err == nil {
+				t.Fatal("store not closed before return")
+			}
+			if generation && !errors.Is(err, store.ErrDatabaseGenerationChanged) {
+				t.Fatalf("late generation terminal cause = %v, want ErrDatabaseGenerationChanged", err)
+			}
+			if !generation && err != nil {
+				t.Fatalf("signal-only terminal cause = %v, want nil", err)
+			}
+			wantDiagnostics := 0
+			if generation {
+				wantDiagnostics = 1
+			}
+			const message = "[engram] database generation changed; stopping server; restart Engram"
+			if strings.Count(diagnostic.String(), message) != wantDiagnostics || strings.Contains(diagnostic.String(), cfg.DataDir) {
+				t.Fatalf("unsafe or duplicate diagnostic: %q", diagnostic.String())
+			}
+		})
+	}
+}
+
 func TestTryStartAutosyncReturnsStopFn(t *testing.T) {
 	cfg := testConfig(t)
 	t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "1")
 	t.Setenv("ENGRAM_CLOUD_TOKEN", "test-token")
-	t.Setenv("ENGRAM_CLOUD_SERVER", "http://localhost:9999")
+	t.Setenv("ENGRAM_CLOUD_SERVER", "https://localhost:9999")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -649,21 +1108,64 @@ func TestCloudEnrollAndSyncHelpDoNotMutateLocalState(t *testing.T) {
 	}
 }
 
+func TestCloudEnrollReportsNormalizedProjectName(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	cfg := testConfig(t)
+	withArgs(t, "engram", "cloud", "enroll", "MiXeD-Project")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+	if recovered != nil {
+		t.Fatalf("cloud enroll should succeed, panic=%v", recovered)
+	}
+	if !strings.Contains(stderr, `⚠️ Project name normalized: "MiXeD-Project" → "mixed-project"`) {
+		t.Fatalf("expected normalization warning, got %q", stderr)
+	}
+	if !strings.Contains(stdout, `✓ Project "mixed-project" enrolled for cloud sync`) {
+		t.Fatalf("expected canonical enrollment confirmation, got %q", stdout)
+	}
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	projects, err := s.ListEnrolledProjects()
+	if err != nil {
+		t.Fatalf("list enrolled projects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].Project != "mixed-project" {
+		t.Fatalf("enrolled projects = %+v, want canonical mixed-project", projects)
+	}
+}
+
 func TestUpdateChecksSkipCriticalStartupCommands(t *testing.T) {
-	if shouldCheckForUpdates([]string{"mcp"}) {
-		t.Fatal("mcp startup must not run update check")
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "mcp", args: []string{"mcp"}},
+		{name: "serve", args: []string{"serve"}},
+		{name: "cloud serve", args: []string{"cloud", "serve"}},
+		{name: "protocol mode", args: []string{"protocol-mode", "claude-code"}},
+		{name: "version", args: []string{"version"}},
+		{name: "version short", args: []string{"-v"}},
+		{name: "version long", args: []string{"--version"}},
+		{name: "help", args: []string{"help"}},
+		{name: "help short", args: []string{"-h"}},
+		{name: "help long", args: []string{"--help"}},
+		{name: "tui", args: []string{"tui"}},
+		{name: "doctor", args: []string{"doctor"}},
+		{name: "regular command", args: []string{"search", "query"}, want: true},
 	}
-	if shouldCheckForUpdates([]string{"serve"}) {
-		t.Fatal("serve startup must not run update check")
-	}
-	if shouldCheckForUpdates([]string{"cloud", "serve"}) {
-		t.Fatal("cloud serve startup must not run update check")
-	}
-	if shouldCheckForUpdates([]string{"protocol-mode", "claude-code"}) {
-		t.Fatal("protocol-mode startup must not run update check")
-	}
-	if !shouldCheckForUpdates([]string{"version"}) {
-		t.Fatal("normal commands should keep update output")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldCheckForUpdates(tt.args); got != tt.want {
+				t.Fatalf("shouldCheckForUpdates(%q) = %t, want %t", tt.args, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -980,7 +1482,85 @@ func TestCmdCloudUpgradeDoctorRequiresProjectAndIsDeterministic(t *testing.T) {
 		if !strings.Contains(bootstrapStderr, "legacy mutation payloads require repair") {
 			t.Fatalf("expected actionable legacy-repair guidance, got %q", bootstrapStderr)
 		}
+		capturedState, err := store.New(cfg)
+		if err != nil {
+			t.Fatalf("reopen store after bootstrap preflight: %v", err)
+		}
+		defer capturedState.Close()
+		state, err := capturedState.GetCloudUpgradeState("proj-legacy")
+		if err != nil || state == nil || !state.Snapshot.Captured || !state.Snapshot.ProjectEnrolled {
+			t.Fatalf("bootstrap must capture enrollment before legacy diagnosis: state=%+v err=%v", state, err)
+		}
 	})
+}
+
+func TestCmdCloudUpgradeDoctorScopesPolicyToProject(t *testing.T) {
+	for _, denied := range []bool{false, true} {
+		t.Run(fmt.Sprintf("selected project denied=%t", denied), func(t *testing.T) {
+			stubExitWithPanic(t)
+			stubRuntimeHooks(t)
+			cfg := testConfig(t)
+			if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test"}); err != nil {
+				t.Fatal(err)
+			}
+			s, err := store.New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := s.Close(); err != nil {
+					t.Errorf("close store: %v", err)
+				}
+			})
+			for _, project := range []string{"project-a", "project-b"} {
+				if err := s.EnrollProject(project); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.MarkSyncHealthy("cloud:project-a"); err != nil {
+				t.Fatal(err)
+			}
+			for _, target := range []string{"cloud:project-b", constants.TargetKeyCloud} {
+				if err := s.MarkSyncBlocked(target, constants.ReasonPolicyForbidden, "project-b denied"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if denied {
+				if err := s.MarkSyncBlocked("cloud:project-a", constants.ReasonPolicyForbidden, "project-a denied"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{Project: "project-a", Stage: store.UpgradeStageBootstrapVerified}); err != nil {
+				t.Fatal(err)
+			}
+
+			withArgs(t, "engram", "cloud", "upgrade", "doctor", "--project", "project-a")
+			stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+			if recovered != nil || stderr != "" {
+				t.Fatalf("doctor must succeed: recovered=%v stderr=%q", recovered, stderr)
+			}
+			want := "project: project-a\nstatus: ready\nclass: ready\nreason_code: upgrade_ready\nmessage: project \"project-a\" is ready for cloud bootstrap\n"
+			wantStage, wantClass, wantCode := store.UpgradeStageDoctorReady, "ready", "upgrade_ready"
+			if denied {
+				want = "project: project-a\nstatus: blocked\nclass: policy\nreason_code: policy_forbidden\nmessage: project \"project-a\" is blocked by organization policy\n"
+				wantStage, wantClass, wantCode = store.UpgradeStageDoctorBlocked, "policy", constants.ReasonPolicyForbidden
+			}
+			if stdout != want {
+				t.Fatalf("doctor output: got %q, want %q", stdout, want)
+			}
+			// Read persisted results through the public CLI, not the underlying tables.
+			withArgs(t, "engram", "cloud", "upgrade", "status", "--project", "project-a")
+			stdout, stderr, recovered = captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+			if recovered != nil || stderr != "" {
+				t.Fatalf("status must succeed: recovered=%v stderr=%q", recovered, stderr)
+			}
+			for _, field := range []string{"stage: " + wantStage, "class: " + wantClass, "reason_code: " + wantCode} {
+				if !strings.Contains(stdout, field+"\n") {
+					t.Fatalf("status missing %q: %q", field, stdout)
+				}
+			}
+		})
+	}
 }
 
 func TestCmdSyncCloudPreflightsLegacyMutationPayloads(t *testing.T) {
@@ -1096,7 +1676,14 @@ func TestCmdCloudUpgradeBootstrapStatusAndRollbackSemantics(t *testing.T) {
 			t.Fatalf("open store: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Close() })
-		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{Project: "proj-a", Stage: store.UpgradeStageBootstrapVerified, RepairClass: store.UpgradeRepairClassReady}); err != nil {
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     "proj-a",
+			Stage:       store.UpgradeStageBootstrapVerified,
+			RepairClass: store.UpgradeRepairClassReady,
+			Snapshot: store.CloudUpgradeSnapshot{
+				Captured: true,
+			},
+		}); err != nil {
 			t.Fatalf("seed verified state: %v", err)
 		}
 
@@ -1139,11 +1726,8 @@ func TestCmdCloudUpgradeBootstrapStatusAndRollbackSemantics(t *testing.T) {
 			if state == nil {
 				return nil, fmt.Errorf("expected pre-bootstrap state snapshot")
 			}
-			if !state.Snapshot.CloudConfigPresent {
-				return nil, fmt.Errorf("expected snapshot cloud config presence to be true")
-			}
-			if !strings.Contains(state.Snapshot.CloudConfigJSON, "cloud.example.test") {
-				return nil, fmt.Errorf("expected snapshot cloud config json to include configured server")
+			if !state.Snapshot.Captured {
+				return nil, fmt.Errorf("expected pre-bootstrap snapshot to be captured")
 			}
 			if state.Snapshot.ProjectEnrolled {
 				return nil, fmt.Errorf("expected snapshot to preserve pre-bootstrap unenrolled state")
@@ -1164,6 +1748,155 @@ func TestCmdCloudUpgradeBootstrapStatusAndRollbackSemantics(t *testing.T) {
 			t.Fatalf("expected verified bootstrap stage output, got %q", stdout)
 		}
 	})
+}
+
+func TestCmdCloudUpgradeBootstrapSnapshotExcludesCloudCredentials(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	const token = "test-bootstrap-token-must-not-reach-sqlite"
+	cfg := testConfig(t)
+	if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test", Token: token}); err != nil {
+		t.Fatalf("save cloud config: %v", err)
+	}
+
+	oldBootstrap := runUpgradeBootstrap
+	runUpgradeBootstrap = func(s *store.Store, project string, _ *cloudConfig) (*engramsync.UpgradeBootstrapResult, error) {
+		var snapshotJSON string
+		if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, project).Scan(&snapshotJSON); err != nil {
+			return nil, fmt.Errorf("read persisted bootstrap snapshot: %w", err)
+		}
+		if strings.Contains(snapshotJSON, token) || strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
+			return nil, fmt.Errorf("bootstrap snapshot persisted credential material: %s", snapshotJSON)
+		}
+		return &engramsync.UpgradeBootstrapResult{Project: project, Stage: store.UpgradeStageBootstrapVerified}, nil
+	}
+	t.Cleanup(func() { runUpgradeBootstrap = oldBootstrap })
+
+	withArgs(t, "engram", "cloud", "upgrade", "bootstrap", "--project", "proj-a")
+	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("bootstrap should not persist cloud credentials, panic=%v stderr=%q", recovered, stderr)
+	}
+}
+
+func TestCmdCloudUpgradeBootstrapCapturesEnrollmentFromPreBootstrapState(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	for _, stage := range []string{store.UpgradeStageDoctorReady, store.UpgradeStageRepairApplied} {
+		t.Run(stage, func(t *testing.T) {
+			cfg := testConfig(t)
+			if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test"}); err != nil {
+				t.Fatalf("save cloud config: %v", err)
+			}
+			s, err := store.New(cfg)
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			if err := s.EnrollProject("proj-a"); err != nil {
+				_ = s.Close()
+				t.Fatalf("seed enrollment: %v", err)
+			}
+			if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+				Project:     "proj-a",
+				Stage:       stage,
+				RepairClass: store.UpgradeRepairClassReady,
+			}); err != nil {
+				_ = s.Close()
+				t.Fatalf("seed pre-bootstrap state: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatalf("close seeded store: %v", err)
+			}
+
+			oldBootstrap := runUpgradeBootstrap
+			runUpgradeBootstrap = func(s *store.Store, project string, _ *cloudConfig) (*engramsync.UpgradeBootstrapResult, error) {
+				state, err := s.GetCloudUpgradeState(project)
+				if err != nil {
+					return nil, fmt.Errorf("load captured state: %w", err)
+				}
+				if state == nil || !state.Snapshot.Captured || !state.Snapshot.ProjectEnrolled {
+					return nil, fmt.Errorf("expected enrolled pre-bootstrap snapshot, got %+v", state)
+				}
+				return &engramsync.UpgradeBootstrapResult{Project: project, Stage: store.UpgradeStageBootstrapVerified}, nil
+			}
+			t.Cleanup(func() { runUpgradeBootstrap = oldBootstrap })
+
+			withArgs(t, "engram", "cloud", "upgrade", "bootstrap", "--project", "proj-a")
+			_, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+			if recovered != nil || stderr != "" {
+				t.Fatalf("bootstrap should capture existing enrollment, panic=%v stderr=%q", recovered, stderr)
+			}
+		})
+	}
+}
+
+func TestCmdCloudUpgradeBootstrapRejectsUncapturedPostSideEffectCheckpoints(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	for _, stage := range []string{
+		store.UpgradeStageBootstrapEnrolled,
+		store.UpgradeStageBootstrapPushed,
+		store.UpgradeStageBootstrapVerified,
+	} {
+		t.Run(stage, func(t *testing.T) {
+			cfg := testConfig(t)
+			if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test"}); err != nil {
+				t.Fatalf("save cloud config: %v", err)
+			}
+			s, err := store.New(cfg)
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			if err := s.EnrollProject("proj-a"); err != nil {
+				_ = s.Close()
+				t.Fatalf("seed enrollment: %v", err)
+			}
+			if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+				Project:     "proj-a",
+				Stage:       stage,
+				RepairClass: store.UpgradeRepairClassRepairable,
+			}); err != nil {
+				_ = s.Close()
+				t.Fatalf("seed uncaptured checkpoint: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatalf("close seeded store: %v", err)
+			}
+
+			called := false
+			oldBootstrap := runUpgradeBootstrap
+			runUpgradeBootstrap = func(*store.Store, string, *cloudConfig) (*engramsync.UpgradeBootstrapResult, error) {
+				called = true
+				return nil, nil
+			}
+			t.Cleanup(func() { runUpgradeBootstrap = oldBootstrap })
+
+			withArgs(t, "engram", "cloud", "upgrade", "bootstrap", "--project", "proj-a")
+			_, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+			if _, ok := recovered.(exitCode); !ok {
+				t.Fatalf("expected bootstrap checkpoint rejection, got %v", recovered)
+			}
+			if !strings.Contains(stderr, "requires a captured pre-bootstrap snapshot") {
+				t.Fatalf("expected captured-snapshot guidance, got %q", stderr)
+			}
+			if called {
+				t.Fatal("bootstrap must not proceed from an uncaptured checkpoint")
+			}
+
+			s, err = store.New(cfg)
+			if err != nil {
+				t.Fatalf("reopen store: %v", err)
+			}
+			defer s.Close()
+			enrolled, err := s.IsProjectEnrolled("proj-a")
+			if err != nil || !enrolled {
+				t.Fatalf("rejected bootstrap must preserve enrollment: enrolled=%t err=%v", enrolled, err)
+			}
+		})
+	}
 }
 
 func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
@@ -1248,47 +1981,10 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("rollback restores cloud config when snapshot captured it", func(t *testing.T) {
+	t.Run("rollback leaves existing cloud config in place", func(t *testing.T) {
+		const token = "test-rollback-token-must-not-reach-sqlite"
 		cfg := testConfig(t)
-		s, err := store.New(cfg)
-		if err != nil {
-			t.Fatalf("open store: %v", err)
-		}
-		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
-			Project:     "proj-a",
-			Stage:       store.UpgradeStageBootstrapPushed,
-			RepairClass: store.UpgradeRepairClassRepairable,
-			Snapshot: store.CloudUpgradeSnapshot{
-				CloudConfigPresent: true,
-				CloudConfigJSON:    `{"server_url":"https://rollback.example.test"}`,
-				ProjectEnrolled:    false,
-			},
-		}); err != nil {
-			_ = s.Close()
-			t.Fatalf("seed rollback state: %v", err)
-		}
-		_ = s.Close()
-
-		withArgs(t, "engram", "cloud", "upgrade", "rollback", "--project", "proj-a")
-		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
-		if recovered != nil || stderr != "" {
-			t.Fatalf("rollback should succeed, panic=%v stderr=%q", recovered, stderr)
-		}
-		if !strings.Contains(stdout, "stage: rolled_back") {
-			t.Fatalf("expected rolled_back stage output, got %q", stdout)
-		}
-		data, err := os.ReadFile(filepath.Join(cfg.DataDir, "cloud.json"))
-		if err != nil {
-			t.Fatalf("expected restored cloud config file: %v", err)
-		}
-		if !strings.Contains(string(data), "rollback.example.test") {
-			t.Fatalf("expected restored cloud config content, got %q", string(data))
-		}
-	})
-
-	t.Run("rollback removes cloud config when snapshot had none", func(t *testing.T) {
-		cfg := testConfig(t)
-		if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test"}); err != nil {
+		if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://rollback.example.test", Token: token}); err != nil {
 			t.Fatalf("seed current cloud config: %v", err)
 		}
 		s, err := store.New(cfg)
@@ -1300,15 +1996,14 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 			Stage:       store.UpgradeStageBootstrapPushed,
 			RepairClass: store.UpgradeRepairClassRepairable,
 			Snapshot: store.CloudUpgradeSnapshot{
-				CloudConfigPresent: false,
-				ProjectEnrolled:    false,
+				Captured:        true,
+				ProjectEnrolled: false,
 			},
 		}); err != nil {
 			_ = s.Close()
 			t.Fatalf("seed rollback state: %v", err)
 		}
 		_ = s.Close()
-
 		withArgs(t, "engram", "cloud", "upgrade", "rollback", "--project", "proj-a")
 		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
 		if recovered != nil || stderr != "" {
@@ -1317,8 +2012,12 @@ func TestCmdCloudUpgradeRepairStatusAndRollbackBranches(t *testing.T) {
 		if !strings.Contains(stdout, "stage: rolled_back") {
 			t.Fatalf("expected rolled_back stage output, got %q", stdout)
 		}
-		if _, err := os.Stat(filepath.Join(cfg.DataDir, "cloud.json")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("expected cloud config to be removed, err=%v", err)
+		data, err := os.ReadFile(filepath.Join(cfg.DataDir, "cloud.json"))
+		if err != nil {
+			t.Fatalf("read existing cloud config after rollback: %v", err)
+		}
+		if !strings.Contains(string(data), "rollback.example.test") || !strings.Contains(string(data), token) {
+			t.Fatalf("expected rollback to leave existing cloud config intact, got %q", string(data))
 		}
 	})
 }
@@ -1335,6 +2034,9 @@ func TestCmdCloudUpgradeHelpShowsGuidedWorkflow(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "doctor -> repair -> bootstrap -> status/rollback") {
 		t.Fatalf("expected guided workflow in help output, got %q", stdout)
+	}
+	if !strings.Contains(stdout, "use remirror only to rebuild cloud state from authoritative local data") {
+		t.Fatalf("expected remirror recovery guidance in help output, got %q", stdout)
 	}
 	if !strings.Contains(stdout, "local SQLite remains source of truth") {
 		t.Fatalf("expected local-first semantics in help output, got %q", stdout)
@@ -1354,6 +2056,7 @@ func TestCloudUpgradeDocsMatchHelpAndLocalFirstSemantics(t *testing.T) {
 
 	helpRequired := []string{
 		"doctor -> repair -> bootstrap -> status/rollback",
+		"use remirror only to rebuild cloud state from authoritative local data",
 		"local SQLite remains source of truth",
 	}
 	for _, token := range helpRequired {
@@ -1664,6 +2367,10 @@ func TestCmdCloudConfigAcceptsValidServerURL(t *testing.T) {
 	stubRuntimeHooks(t)
 
 	cfg := testConfig(t)
+	const savedToken = "stored-token"
+	if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://previous.example.test", Token: savedToken}); err != nil {
+		t.Fatalf("seed cloud config: %v", err)
+	}
 	withArgs(t, "engram", "cloud", "config", "--server", "https://cloud.example.test")
 	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
 	if recovered != nil || stderr != "" {
@@ -1677,9 +2384,63 @@ func TestCmdCloudConfigAcceptsValidServerURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load cloud config: %v", err)
 	}
-	if cc == nil || cc.ServerURL != "https://cloud.example.test" {
-		t.Fatalf("expected persisted server URL, got %+v", cc)
+	if cc == nil {
+		t.Fatal("expected persisted cloud config")
 	}
+	if cc.ServerURL != "https://cloud.example.test" {
+		t.Fatalf("expected persisted server URL, got %q", cc.ServerURL)
+	}
+	if cc.Token != savedToken {
+		t.Fatal("expected existing cloud token to be preserved")
+	}
+}
+
+func TestCmdCloudConfigCreatesMissingConfigAndPreservesLoadFailureFile(t *testing.T) {
+	t.Run("missing config is saved as an empty config", func(t *testing.T) {
+		stubExitWithPanic(t)
+		stubRuntimeHooks(t)
+		cfg := testConfig(t)
+
+		withArgs(t, "engram", "cloud", "config", "--server", "https://cloud.example.test")
+		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+		if recovered != nil || stderr != "" || !strings.Contains(stdout, "Cloud server set") {
+			t.Fatalf("cloud config result = stdout %q stderr %q panic %v", stdout, stderr, recovered)
+		}
+		config, err := loadCloudConfig(cfg)
+		if err != nil {
+			t.Fatalf("load saved cloud config: %v", err)
+		}
+		if config.ServerURL != "https://cloud.example.test" || config.Token != "" {
+			t.Fatalf("saved cloud config = %+v, want server-only config", config)
+		}
+	})
+
+	t.Run("load failure is fatal and does not overwrite the file", func(t *testing.T) {
+		stubExitWithPanic(t)
+		stubRuntimeHooks(t)
+		cfg := testConfig(t)
+		path := filepath.Join(cfg.DataDir, "cloud.json")
+		raw := []byte(`{"token":"stored-token"`)
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatalf("write malformed cloud config: %v", err)
+		}
+
+		withArgs(t, "engram", "cloud", "config", "--server", "https://cloud.example.test")
+		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+		if _, ok := recovered.(exitCode); !ok {
+			t.Fatalf("cloud config load failure panic = %v, want fatal exit", recovered)
+		}
+		if stdout != "" || !strings.Contains(stderr, "engram:") {
+			t.Fatalf("cloud config load failure output = stdout %q stderr %q", stdout, stderr)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read cloud config after failed update: %v", err)
+		}
+		if string(after) != string(raw) {
+			t.Fatalf("cloud config was overwritten after load failure: %q", after)
+		}
+	})
 }
 
 func TestCmdCloudStatusSurfacesCloudConfigParseError(t *testing.T) {
@@ -2062,7 +2823,7 @@ func TestCmdServeSyncStatusUsesDetectedProjectScopedState(t *testing.T) {
 	}
 }
 
-func TestCmdServeSyncStatusRequiresProjectScopeWhenNoDefaultResolves(t *testing.T) {
+func TestCmdServeSyncStatusUsesCurrentProjectWhenNoOverrideResolves(t *testing.T) {
 	stubExitWithPanic(t)
 	stubRuntimeHooks(t)
 
@@ -2093,10 +2854,10 @@ func TestCmdServeSyncStatusRequiresProjectScopeWhenNoDefaultResolves(t *testing.
 		}
 		body := rec.Body.String()
 		if !strings.Contains(body, `"enabled":false`) {
-			t.Fatalf("expected enabled=false when no project scope resolves, got body=%q", body)
+			t.Fatalf("expected enabled=false for the unresolved current project, got body=%q", body)
 		}
-		if !strings.Contains(body, `"reason_code":"project_required"`) {
-			t.Fatalf("expected project_required reason code, got body=%q", body)
+		if !strings.Contains(body, `"reason_code":"blocked_unenrolled"`) {
+			t.Fatalf("expected blocked_unenrolled reason code for the current project, got body=%q", body)
 		}
 		return nil
 	}
@@ -2186,6 +2947,18 @@ func TestStoreSyncStatusProviderRequiresExplicitProjectScope(t *testing.T) {
 	}
 	if !strings.Contains(status.ReasonMessage, "explicit project") {
 		t.Fatalf("expected explicit project message, got %q", status.ReasonMessage)
+	}
+}
+
+func TestSyncStatusUsesLastSuccessfulSyncAfterLifecycleDegrades(t *testing.T) {
+	lastSuccess := "2026-08-30T10:00:00Z"
+	status := syncStatusFromState(&store.SyncState{
+		Lifecycle:           store.SyncLifecycleDegraded,
+		LastSuccessAt:       &lastSuccess,
+		ConsecutiveFailures: 1,
+	})
+	if status.LastSyncAt == nil || !status.LastSyncAt.Equal(time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)) {
+		t.Fatalf("last_sync_at = %v, want last successful sync", status.LastSyncAt)
 	}
 }
 
@@ -2444,7 +3217,11 @@ func TestCmdExportDefaultAndCmdImportErrors(t *testing.T) {
 	mustSeedObservation(t, cfg, "s-exp-default", "proj", "note", "title", "content", "project")
 
 	withArgs(t, "engram", "export")
-	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdExport(cfg) })
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() {
+		if _, err := cmdExport(cfg); err != nil {
+			fatal(err)
+		}
+	})
 	if recovered != nil || stderr != "" {
 		t.Fatalf("export default should succeed, panic=%v stderr=%q", recovered, stderr)
 	}
@@ -2457,8 +3234,12 @@ func TestCmdExportDefaultAndCmdImportErrors(t *testing.T) {
 
 	badPath := filepath.Join(workDir, "missing", "out.json")
 	withArgs(t, "engram", "export", badPath)
-	_, stderr, recovered = captureOutputAndRecover(t, func() { cmdExport(cfg) })
-	if _, ok := recovered.(exitCode); !ok || !strings.Contains(stderr, "no such file or directory") {
+	_, stderr, recovered = captureOutputAndRecover(t, func() {
+		if _, err := cmdExport(cfg); err != nil {
+			fatal(err)
+		}
+	})
+	if _, ok := recovered.(exitCode); !ok || !strings.Contains(stderr, "out.json") {
 		t.Fatalf("expected export write fatal, panic=%v stderr=%q", recovered, stderr)
 	}
 
@@ -2508,6 +3289,26 @@ func TestMainDispatchServeMCPAndTUI(t *testing.T) {
 	}
 }
 
+func TestMainTUISkipsOuterUpdateCheck(t *testing.T) {
+	stubRuntimeHooks(t)
+	t.Setenv("ENGRAM_DATA_DIR", t.TempDir())
+	withArgs(t, "engram", "tui")
+
+	checks := 0
+	checkForUpdates = func(string) versioncheck.CheckResult {
+		checks++
+		return versioncheck.CheckResult{Status: versioncheck.StatusUpToDate}
+	}
+
+	_, stderr, recovered := captureOutputAndRecover(t, func() { main() })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("tui dispatch failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if checks != 0 {
+		t.Fatalf("outer tui update checks = %d, want 0", checks)
+	}
+}
+
 func TestStoreInitFailurePaths(t *testing.T) {
 	stubRuntimeHooks(t)
 	stubExitWithPanic(t)
@@ -2522,7 +3323,11 @@ func TestStoreInitFailurePaths(t *testing.T) {
 	}
 
 	cmds := []func(store.Config){
-		cmdServe,
+		func(cfg store.Config) {
+			if err := cmdServe(cfg); err != nil {
+				fatal(err)
+			}
+		},
 		cmdMCP,
 		cmdTUI,
 		cmdSearch,
@@ -2530,7 +3335,11 @@ func TestStoreInitFailurePaths(t *testing.T) {
 		cmdTimeline,
 		cmdContext,
 		cmdStats,
-		cmdExport,
+		func(cfg store.Config) {
+			if _, err := cmdExport(cfg); err != nil {
+				fatal(err)
+			}
+		},
 		cmdImport,
 		cmdSync,
 	}
@@ -2607,6 +3416,7 @@ func TestMainDispatchRemainingCommands(t *testing.T) {
 	}
 	seedCfg.DataDir = dataDir
 	focusID := mustSeedObservation(t, seedCfg, "s-main", "main-proj", "note", "focus", "focus content", "project")
+	t.Setenv("ENGRAM_PROJECT", "main-proj")
 
 	importFile := filepath.Join(t.TempDir(), "import.json")
 	if err := os.WriteFile(importFile, []byte(`{"version":"0.1.0","exported_at":"2026-01-01T00:00:00Z","sessions":[],"observations":[],"prompts":[]}`), 0644); err != nil {
@@ -3126,10 +3936,12 @@ func TestCmdSyncCloudSuccessMarksTargetHealthy(t *testing.T) {
 
 	originalSyncStatus := syncStatus
 	originalSyncImport := syncImport
+	originalSyncImportWithProgress := syncImportWithProgress
 	originalSyncExport := syncExport
 	t.Cleanup(func() {
 		syncStatus = originalSyncStatus
 		syncImport = originalSyncImport
+		syncImportWithProgress = originalSyncImportWithProgress
 		syncExport = originalSyncExport
 	})
 
@@ -3153,7 +3965,9 @@ func TestCmdSyncCloudSuccessMarksTargetHealthy(t *testing.T) {
 			name: "import",
 			args: []string{"engram", "sync", "--cloud", "--import", "--project", "proj-a"},
 			stub: func() {
-				syncImport = func(*engramsync.Syncer) (*engramsync.ImportResult, error) {
+				syncImportWithProgress = func(_ *engramsync.Syncer, report func(engramsync.ImportProgress)) (*engramsync.ImportResult, error) {
+					report(engramsync.ImportProgress{Percentage: 100})
+					report(engramsync.ImportProgress{Percentage: 100})
 					return &engramsync.ImportResult{}, nil
 				}
 			},
@@ -3239,9 +4053,11 @@ func TestCmdSyncCloudImportKeepsPendingWhenLocalMutationsRemain(t *testing.T) {
 	stubRuntimeHooks(t)
 
 	originalSyncImport := syncImport
+	originalSyncImportWithProgress := syncImportWithProgress
 	originalSyncStatus := syncStatus
 	t.Cleanup(func() {
 		syncImport = originalSyncImport
+		syncImportWithProgress = originalSyncImportWithProgress
 		syncStatus = originalSyncStatus
 	})
 
@@ -3284,7 +4100,9 @@ func TestCmdSyncCloudImportKeepsPendingWhenLocalMutationsRemain(t *testing.T) {
 		t.Fatalf("close store: %v", err)
 	}
 
-	syncImport = func(*engramsync.Syncer) (*engramsync.ImportResult, error) {
+	syncImportWithProgress = func(_ *engramsync.Syncer, report func(engramsync.ImportProgress)) (*engramsync.ImportResult, error) {
+		report(engramsync.ImportProgress{Percentage: 100})
+		report(engramsync.ImportProgress{Percentage: 100})
 		return &engramsync.ImportResult{}, nil
 	}
 	syncStatus = func(*engramsync.Syncer) (int, int, int, error) {
@@ -3702,6 +4520,51 @@ func TestCmdSyncCloudRequiresExplicitProjectAndRejectsAll(t *testing.T) {
 	}
 }
 
+func TestCmdSyncRejectsCombinedProjectSelectorsBeforeStoreConstruction(t *testing.T) {
+	for _, args := range [][]string{
+		{"engram", "sync", "--all", "--project", "alpha"},
+		{"engram", "sync", "--project", "alpha", "--all"},
+	} {
+		t.Run(strings.Join(args[2:], " "), func(t *testing.T) {
+			stubExitWithPanic(t)
+			calledStoreNew := false
+			originalStoreNew := storeNew
+			storeNew = func(store.Config) (*store.Store, error) {
+				calledStoreNew = true
+				return nil, errors.New("store must not be constructed")
+			}
+			t.Cleanup(func() { storeNew = originalStoreNew })
+
+			withArgs(t, args...)
+			_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(testConfig(t)) })
+			if _, ok := recovered.(exitCode); !ok {
+				t.Fatalf("expected combined selectors to exit, got %v", recovered)
+			}
+			if !strings.Contains(stderr, "--all and --project cannot be used together") {
+				t.Fatalf("combined selector error = %q", stderr)
+			}
+			if calledStoreNew {
+				t.Fatal("combined selectors constructed a store")
+			}
+		})
+	}
+
+	for _, args := range [][]string{
+		{"engram", "sync", "--all", "--status"},
+		{"engram", "sync", "--project", "alpha", "--status"},
+	} {
+		t.Run(strings.Join(args[2:], " "), func(t *testing.T) {
+			stubExitWithPanic(t)
+			withCwd(t, t.TempDir())
+			withArgs(t, args...)
+			stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(testConfig(t)) })
+			if recovered != nil || stderr != "" || !strings.Contains(stdout, "Sync status:") {
+				t.Fatalf("valid selector failed: stdout=%q stderr=%q panic=%v", stdout, stderr, recovered)
+			}
+		})
+	}
+}
+
 func TestCmdImportStoreImportFailure(t *testing.T) {
 	stubExitWithPanic(t)
 	cfg := testConfig(t)
@@ -3729,15 +4592,28 @@ func TestCmdImportStoreImportFailure(t *testing.T) {
 }
 
 func TestCmdSearchAndSaveDanglingFlags(t *testing.T) {
+	stubExitWithPanic(t)
 	cfg := testConfig(t)
 
 	withArgs(t, "engram", "save", "dangling-title", "dangling-content", "--type")
+	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
+	if _, ok := recovered.(exitCode); !ok {
+		t.Fatalf("save with dangling flag panic = %v, want exitCode", recovered)
+	}
+	if !strings.Contains(stderr, "--type requires a value") {
+		t.Fatalf("save with dangling flag stderr = %q, want --type requires a value", stderr)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, "engram.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("save with dangling flag opened store or left state: %v", err)
+	}
+
+	withArgs(t, "engram", "save", "dangling-title", "dangling-content")
 	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
 	if recovered != nil || stderr != "" {
-		t.Fatalf("save with dangling flag failed, panic=%v stderr=%q", recovered, stderr)
+		t.Fatalf("valid save failed, panic=%v stderr=%q", recovered, stderr)
 	}
 	if !strings.Contains(stdout, "Memory saved:") {
-		t.Fatalf("unexpected save output: %q", stdout)
+		t.Fatalf("unexpected valid save output: %q", stdout)
 	}
 
 	withArgs(t, "engram", "search", "dangling-content", "--limit", "not-a-number", "--project")
@@ -3747,6 +4623,32 @@ func TestCmdSearchAndSaveDanglingFlags(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Found") {
 		t.Fatalf("unexpected search output: %q", stdout)
+	}
+}
+
+func TestCmdSearchForwardsMatchModeWithoutChangingQuery(t *testing.T) {
+	cfg := testConfig(t)
+
+	var gotQuery string
+	var gotOpts store.SearchOptions
+	oldStoreSearch := storeSearch
+	storeSearch = func(_ *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, error) {
+		gotQuery = query
+		gotOpts = opts
+		return nil, nil
+	}
+	t.Cleanup(func() { storeSearch = oldStoreSearch })
+
+	withArgs(t, "engram", "search", "auth", "compliance", "session", "--all", "--match", "any")
+	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSearch(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("search failed, panic=%v stderr=%q", recovered, stderr)
+	}
+	if gotOpts.MatchMode != "any" {
+		t.Fatalf("match mode=%q want any", gotOpts.MatchMode)
+	}
+	if gotQuery != "auth compliance session" {
+		t.Fatalf("query=%q want %q", gotQuery, "auth compliance session")
 	}
 }
 
@@ -3780,6 +4682,7 @@ func TestCmdSetupHyphenArgFallsBackToInteractive(t *testing.T) {
 func TestCmdTimelineNoBeforeAfterSections(t *testing.T) {
 	cfg := testConfig(t)
 	focusID := mustSeedObservation(t, cfg, "solo-session", "solo", "note", "focus", "only content", "project")
+	t.Setenv("ENGRAM_PROJECT", "solo")
 
 	withArgs(t, "engram", "timeline", fmt.Sprintf("%d", focusID), "--before", "0", "--after", "0")
 	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdTimeline(cfg) })
@@ -3858,6 +4761,30 @@ func TestCmdSyncImportEmptyAndMixedChunks(t *testing.T) {
 	})
 }
 
+func TestCmdSyncImportPrintsRelationCounts(t *testing.T) {
+	stubExitWithPanic(t)
+	workDir := t.TempDir()
+	withCwd(t, workDir)
+	cfg := testConfig(t)
+
+	originalSyncImport := syncImport
+	t.Cleanup(func() { syncImport = originalSyncImport })
+	syncImport = func(*engramsync.Syncer) (*engramsync.ImportResult, error) {
+		return &engramsync.ImportResult{RelationsReplayed: 2, RelationsDeferred: 3, RelationsDead: 4}, nil
+	}
+
+	withArgs(t, "engram", "sync", "--import")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("sync import failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	for _, want := range []string{"No new chunks to import", "Relations replayed: 2", "Relations deferred: 3", "Relations dead:     4"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected output to contain %q, got %q", want, stdout)
+		}
+	}
+}
+
 func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 	stubRuntimeHooks(t)
 	stubExitWithPanic(t)
@@ -3892,7 +4819,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 	})
 
 	t.Run("timeline seam error", func(t *testing.T) {
-		withArgs(t, "engram", "timeline", "1")
+		withArgs(t, "engram", "timeline", "1", "--all")
 		storeTimeline = func(*store.Store, int64, int, int) (*store.TimelineResult, error) {
 			return nil, errors.New("forced timeline error")
 		}
@@ -3902,7 +4829,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 
 	t.Run("timeline prints session summary", func(t *testing.T) {
 		summary := "this session has a non-empty summary"
-		withArgs(t, "engram", "timeline", "1")
+		withArgs(t, "engram", "timeline", "1", "--all")
 		storeTimeline = func(*store.Store, int64, int, int) (*store.TimelineResult, error) {
 			return &store.TimelineResult{
 				Focus:        store.Observation{ID: 1, Type: "note", Title: "focus", Content: "content", CreatedAt: "2026-01-01"},
@@ -3929,7 +4856,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 	})
 
 	t.Run("stats seam error", func(t *testing.T) {
-		withArgs(t, "engram", "stats")
+		withArgs(t, "engram", "stats", "--all")
 		storeStats = func(*store.Store) (*store.Stats, error) {
 			return nil, errors.New("forced stats error")
 		}
@@ -3938,11 +4865,15 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 	})
 
 	t.Run("export seam error", func(t *testing.T) {
-		withArgs(t, "engram", "export")
+		withArgs(t, "engram", "export", "--all")
 		storeExport = func(*store.Store) (*store.ExportData, error) {
 			return nil, errors.New("forced export error")
 		}
-		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdExport(cfg) })
+		_, stderr, recovered := captureOutputAndRecover(t, func() {
+			if _, err := cmdExport(cfg); err != nil {
+				fatal(err)
+			}
+		})
 		assertFatal(t, stderr, recovered, "forced export error")
 	})
 
@@ -3952,7 +4883,11 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 		jsonMarshalIndent = func(any, string, string) ([]byte, error) {
 			return nil, errors.New("forced marshal error")
 		}
-		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdExport(cfg) })
+		_, stderr, recovered := captureOutputAndRecover(t, func() {
+			if _, err := cmdExport(cfg); err != nil {
+				fatal(err)
+			}
+		})
 		assertFatal(t, stderr, recovered, "forced marshal error")
 	})
 
@@ -4067,7 +5002,7 @@ func TestCmdMCP(t *testing.T) {
 	t.Run("cloud autosync env with token and server starts and stops manager", func(t *testing.T) {
 		t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "1")
 		t.Setenv("ENGRAM_CLOUD_TOKEN", "tok")
-		t.Setenv("ENGRAM_CLOUD_SERVER", "http://localhost:9999")
+		t.Setenv("ENGRAM_CLOUD_SERVER", "https://localhost:9999")
 
 		runStarted := make(chan struct{}, 1)
 		stopCalled := make(chan struct{}, 1)
@@ -4132,7 +5067,7 @@ func TestCmdMCPAutosyncPushesWriteDuringServe(t *testing.T) {
 	observationPushed := make(chan struct{})
 	var closeObservationPushed sync.Once
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -4177,6 +5112,7 @@ func TestCmdMCPAutosyncPushesWriteDuringServe(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	trustTLSServer(t, srv)
 
 	t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "1")
 	t.Setenv("ENGRAM_CLOUD_TOKEN", "test-token")
@@ -4255,7 +5191,7 @@ func TestCmdMCPAutosyncPollTickerPullsDuringServe(t *testing.T) {
 	pullCalled := make(chan struct{})
 	var closePullCalled sync.Once
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -4283,6 +5219,7 @@ func TestCmdMCPAutosyncPollTickerPullsDuringServe(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	trustTLSServer(t, srv)
 
 	t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "1")
 	t.Setenv("ENGRAM_CLOUD_TOKEN", "test-token")
@@ -4323,5 +5260,217 @@ func TestCmdMCPAutosyncPollTickerPullsDuringServe(t *testing.T) {
 	_, stderr, recovered := captureOutputAndRecover(t, func() { cmdMCP(cfg) })
 	if recovered != nil || stderr != "" {
 		t.Fatalf("expected MCP autosync poll ticker proof to complete cleanly, panic=%v stderr=%q", recovered, stderr)
+	}
+}
+
+// TestCmdSaveRejectsEmptyTitle pins that `engram save` exits non-zero with the
+// store's title-admission message instead of persisting a titleless
+// observation (#459). The guard runs before the store is opened, so a rejected
+// save must not even create the database or the `manual-save` session.
+func TestCmdSaveRejectsEmptyTitle(t *testing.T) {
+	cfg := testConfig(t)
+	stubExitWithPanic(t)
+
+	for _, title := range []string{"", "   ", " \t\n "} {
+		withArgs(t, "engram", "save", title, "content body")
+		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
+		if _, ok := recovered.(exitCode); !ok {
+			t.Fatalf("title %q: expected exit panic, got %v", title, recovered)
+		}
+		if !strings.Contains(stderr, store.ErrObservationTitleRequired.Error()) {
+			t.Fatalf("title %q: stderr missing title guard message: %q", title, stderr)
+		}
+		if _, err := os.Stat(filepath.Join(cfg.DataDir, "engram.db")); !os.IsNotExist(err) {
+			t.Fatalf("title %q: rejected save opened the store (stat error %v)", title, err)
+		}
+	}
+
+	// A valid title still saves, so the guard is not rejecting everything.
+	withArgs(t, "engram", "save", "Real title", "content body")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
+	if recovered != nil {
+		t.Fatalf("valid save exited: %v (stderr %q)", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "Memory saved") {
+		t.Fatalf("expected a saved memory, got stdout %q stderr %q", stdout, stderr)
+	}
+}
+
+func TestCmdSyncCloudImportRendersBoundedProgressBeforeSummary(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	originalSyncImportWithProgress := syncImportWithProgress
+	originalSyncStatus := syncStatus
+	t.Cleanup(func() {
+		syncImportWithProgress = originalSyncImportWithProgress
+		syncStatus = originalSyncStatus
+	})
+
+	cfg := testConfig(t)
+	t.Setenv("ENGRAM_CLOUD_SERVER", "https://cloud.example.test")
+	t.Setenv("ENGRAM_CLOUD_TOKEN", "token-abc")
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := s.EnrollProject("proj-a"); err != nil {
+		_ = s.Close()
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	syncImportWithProgress = func(_ *engramsync.Syncer, report func(engramsync.ImportProgress)) (*engramsync.ImportResult, error) {
+		report(engramsync.ImportProgress{LocalChunks: 0, RemoteChunks: 12, PendingChunks: 12, Percentage: 0})
+		for completed := 1; completed <= 12; completed++ {
+			report(engramsync.ImportProgress{LocalChunks: completed, RemoteChunks: 12, PendingChunks: 12 - completed, Percentage: completed * 100 / 12})
+		}
+		return &engramsync.ImportResult{ChunksImported: 12}, nil
+	}
+	syncStatus = func(*engramsync.Syncer) (int, int, int, error) { return 12, 12, 0, nil }
+
+	withArgs(t, "engram", "sync", "--cloud", "--import", "--project", "proj-a")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("cloud import should succeed, panic=%v stderr=%q", recovered, stderr)
+	}
+	if got := strings.Count(stdout, "Cloud import progress:"); got != 7 {
+		t.Fatalf("progress line count = %d, want initial + 5 bounded updates + final; output=%q", got, stdout)
+	}
+	if !strings.Contains(stdout, "Cloud import progress: local=0 remote=12 pending=12 progress=0%") ||
+		!strings.Contains(stdout, "Cloud import progress: local=12 remote=12 pending=0 progress=100%") {
+		t.Fatalf("progress output missing initial or final snapshot: %q", stdout)
+	}
+	if strings.LastIndex(stdout, "Cloud import progress:") > strings.Index(stdout, "Imported 12 new remote chunk(s)") {
+		t.Fatalf("final progress must precede the existing import summary: %q", stdout)
+	}
+}
+
+func TestCmdSyncCloudNoOpImportRendersInitialAndFinalProgress(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	originalSyncImportWithProgress := syncImportWithProgress
+	originalSyncStatus := syncStatus
+	t.Cleanup(func() {
+		syncImportWithProgress = originalSyncImportWithProgress
+		syncStatus = originalSyncStatus
+	})
+
+	cfg := testConfig(t)
+	t.Setenv("ENGRAM_CLOUD_SERVER", "https://cloud.example.test")
+	t.Setenv("ENGRAM_CLOUD_TOKEN", "token-abc")
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := s.EnrollProject("proj-a"); err != nil {
+		_ = s.Close()
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	syncImportWithProgress = func(_ *engramsync.Syncer, report func(engramsync.ImportProgress)) (*engramsync.ImportResult, error) {
+		report(engramsync.ImportProgress{LocalChunks: 3, RemoteChunks: 3, PendingChunks: 0, Percentage: 100})
+		report(engramsync.ImportProgress{LocalChunks: 3, RemoteChunks: 3, PendingChunks: 0, Percentage: 100})
+		return &engramsync.ImportResult{}, nil
+	}
+	syncStatus = func(*engramsync.Syncer) (int, int, int, error) { return 3, 3, 0, nil }
+
+	withArgs(t, "engram", "sync", "--cloud", "--import", "--project", "proj-a")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("cloud no-op import should succeed, panic=%v stderr=%q", recovered, stderr)
+	}
+	if got := strings.Count(stdout, "Cloud import progress: local=3 remote=3 pending=0 progress=100%"); got != 2 {
+		t.Fatalf("no-op progress snapshots = %d, want initial and final; output=%q", got, stdout)
+	}
+	if strings.LastIndex(stdout, "Cloud import progress:") > strings.Index(stdout, "No new chunks to import.") {
+		t.Fatalf("final no-op progress must precede the existing summary: %q", stdout)
+	}
+}
+
+// TestCmdSyncCloudImportPrintsSkippedRelationWarnings verifies that relation
+// upserts skipped for permanently missing endpoints surface as visible CLI
+// warnings (issue #1135) instead of dying silently in the deferred queue, on
+// both the imported-chunks path and the no-new-chunks path.
+func TestCmdSyncCloudImportPrintsSkippedRelationWarnings(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	originalSyncImport := syncImport
+	originalSyncImportWithProgress := syncImportWithProgress
+	originalSyncStatus := syncStatus
+	t.Cleanup(func() {
+		syncImport = originalSyncImport
+		syncImportWithProgress = originalSyncImportWithProgress
+		syncStatus = originalSyncStatus
+	})
+
+	workDir := t.TempDir()
+	withCwd(t, workDir)
+	cfg := testConfig(t)
+
+	t.Setenv("ENGRAM_CLOUD_SERVER", "https://cloud.example.test")
+	t.Setenv("ENGRAM_CLOUD_TOKEN", "token-abc")
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.EnrollProject("proj-a"); err != nil {
+		_ = s.Close()
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		result *engramsync.ImportResult
+	}{
+		{
+			name: "imported chunks",
+			result: &engramsync.ImportResult{
+				ChunksImported:       1,
+				SessionsImported:     1,
+				ObservationsImported: 1,
+				SkippedRelations:     []string{"relation rel-a obs-a->obs-b: referenced observation missing permanently"},
+			},
+		},
+		{
+			name: "no new chunks",
+			result: &engramsync.ImportResult{
+				ChunksSkipped:    1,
+				SkippedRelations: []string{"relation rel-a obs-a->obs-b: referenced observation missing permanently"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			syncImportWithProgress = func(_ *engramsync.Syncer, report func(engramsync.ImportProgress)) (*engramsync.ImportResult, error) {
+				report(engramsync.ImportProgress{Percentage: 100})
+				report(engramsync.ImportProgress{Percentage: 100})
+				return tc.result, nil
+			}
+			syncStatus = func(*engramsync.Syncer) (int, int, int, error) {
+				return 1, 1, 0, nil
+			}
+
+			withArgs(t, "engram", "sync", "--cloud", "--import", "--project", "proj-a")
+			stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
+			if recovered != nil || stderr != "" {
+				t.Fatalf("expected successful cloud import, panic=%v stderr=%q", recovered, stderr)
+			}
+			if !strings.Contains(stdout, "WARNING skipped relation rel-a obs-a->obs-b: referenced observation missing permanently") {
+				t.Fatalf("expected skipped relation warning in import output, got:\n%s", stdout)
+			}
+		})
 	}
 }

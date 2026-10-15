@@ -12,6 +12,7 @@
 package setup
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -22,7 +23,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Gentleman-Programming/engram/internal/mcp"
+	"github.com/Gentleman-Programming/engram/v3/internal/command"
+	"github.com/Gentleman-Programming/engram/v3/internal/mcp"
 )
 
 var (
@@ -31,7 +33,10 @@ var (
 	lookPathFn   = exec.LookPath
 	osExecutable = os.Executable
 	runCommand   = func(name string, args ...string) ([]byte, error) {
-		return exec.Command(name, args...).CombinedOutput()
+		return command.NewContext(context.Background(), name, args...).CombinedOutput()
+	}
+	runCommandWithContext = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return command.NewContext(ctx, name, args...).CombinedOutput()
 	}
 	openCodeReadFile = func(path string) ([]byte, error) {
 		return openCodeFS.ReadFile(path)
@@ -73,6 +78,7 @@ type Result struct {
 	Agent            string
 	Destination      string
 	Files            int
+	MCPConfigured    bool
 	TUIPluginEnabled bool
 }
 
@@ -306,7 +312,7 @@ func installPi() (*Result, error) {
 		files++
 	}
 
-	return &Result{Agent: "pi", Destination: agentDir, Files: files}, nil
+	return &Result{Agent: "pi", Destination: agentDir, Files: files, MCPConfigured: true}, nil
 }
 
 func ensurePiPackageSettings(settingsPath string) (bool, error) {
@@ -514,6 +520,7 @@ func installOpenCode() (*Result, error) {
 	}
 
 	return &Result{
+		MCPConfigured:    true,
 		Agent:            "opencode",
 		Destination:      dir,
 		Files:            files,
@@ -771,9 +778,10 @@ func installClaudeCode() (*Result, error) {
 	}
 
 	return &Result{
-		Agent:       "claude-code",
-		Destination: claudeCodeMCPDir(),
-		Files:       files,
+		MCPConfigured: true,
+		Agent:         "claude-code",
+		Destination:   claudeCodeMCPDir(),
+		Files:         files,
 	}, nil
 }
 
@@ -929,9 +937,10 @@ func installGeminiCLI() (*Result, error) {
 	removeGeminiEnvOverride()
 
 	return &Result{
-		Agent:       "gemini-cli",
-		Destination: filepath.Dir(path),
-		Files:       2,
+		MCPConfigured: true,
+		Agent:         "gemini-cli",
+		Destination:   filepath.Dir(path),
+		Files:         2,
 	}, nil
 }
 
@@ -1091,9 +1100,10 @@ func installCodex() (*Result, error) {
 		fmt.Fprintf(os.Stderr, "    codex plugin marketplace add %s --ref main\n", codexMarketplace)
 		fmt.Fprintf(os.Stderr, "    codex plugin add engram@engram\n")
 		return &Result{
-			Agent:       "codex",
-			Destination: filepath.Dir(path),
-			Files:       3,
+			MCPConfigured: true,
+			Agent:         "codex",
+			Destination:   filepath.Dir(path),
+			Files:         3,
 		}, nil
 	}
 
@@ -1112,9 +1122,10 @@ func installCodex() (*Result, error) {
 	}
 
 	return &Result{
-		Agent:       "codex",
-		Destination: filepath.Dir(path),
-		Files:       3,
+		MCPConfigured: true,
+		Agent:         "codex",
+		Destination:   filepath.Dir(path),
+		Files:         3,
 	}, nil
 }
 

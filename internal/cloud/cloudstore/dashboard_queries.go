@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
-	"github.com/Gentleman-Programming/engram/internal/store"
-	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/v3/internal/sync"
 )
 
 var ErrDashboardProjectInvalid = errors.New("cloudstore: dashboard project is invalid")
@@ -888,7 +888,16 @@ func (m dashboardReadModel) filterPrompts(project, query string) []DashboardProm
 	return rows
 }
 
+// loadDashboardReadModel applies legacy deployment policy at every read boundary.
 func (cs *CloudStore) loadDashboardReadModel() (dashboardReadModel, error) {
+	model, err := cs.loadDashboardNeutralReadModel()
+	if err != nil {
+		return dashboardReadModel{}, err
+	}
+	return model.scoped(cs.dashboardAllowedScopes), nil
+}
+
+func (cs *CloudStore) loadDashboardNeutralReadModel() (dashboardReadModel, error) {
 	if cs == nil {
 		return dashboardReadModel{}, fmt.Errorf("cloudstore: not initialized")
 	}
@@ -937,7 +946,30 @@ func (cs *CloudStore) buildDashboardReadModel() (dashboardReadModel, error) {
 	if err != nil {
 		return dashboardReadModel{}, err
 	}
-	return model.scoped(cs.dashboardAllowedScopes), nil
+	controls, err := cs.ListProjectSyncControls()
+	if err != nil {
+		return dashboardReadModel{}, err
+	}
+	return model.withRegisteredProjects(controls), nil
+}
+
+// withRegisteredProjects preserves content-derived inventory and adds empty registrations.
+func (m dashboardReadModel) withRegisteredProjects(controls []ProjectSyncControl) dashboardReadModel {
+	for _, control := range controls {
+		project := strings.TrimSpace(control.Project)
+		if project == "" {
+			continue
+		}
+		if _, exists := m.projectDetails[project]; exists {
+			continue
+		}
+		row := DashboardProjectRow{Project: project}
+		m.projects = append(m.projects, row)
+		m.projectDetails[project] = DashboardProjectDetail{Project: project, Stats: row}
+	}
+	sort.Slice(m.projects, func(i, j int) bool { return m.projects[i].Project < m.projects[j].Project })
+	m.admin.Projects = len(m.projects)
+	return m
 }
 
 func (cs *CloudStore) ListProjects(query string) ([]DashboardProjectRow, error) {
@@ -1077,6 +1109,435 @@ func (cs *CloudStore) AdminOverview() (DashboardAdminOverview, error) {
 	return model.admin, nil
 }
 
+// DashboardScopedStore is an immutable, request-owned view over CloudStore's
+// permission-neutral dashboard read model. It never updates the shared cache.
+type DashboardScopedStore struct {
+	base    *CloudStore
+	model   dashboardReadModel
+	allowed map[string]struct{}
+}
+
+// DashboardStoreForProjects scopes the neutral cache by managed grants only.
+// An empty grant set intentionally produces an empty view, never wildcard access.
+func (cs *CloudStore) DashboardStoreForProjects(projects []string) (*DashboardScopedStore, error) {
+	model, err := cs.loadDashboardNeutralReadModel()
+	if err != nil {
+		return nil, err
+	}
+	// Grants carry normalized identities, while the read model retains canonical
+	// names. An ambiguous identity must authorize neither project, even when a
+	// canonical name itself equals that identity.
+	canonicalByGrant := make(map[string]string, len(model.projects))
+	for _, row := range model.projects {
+		key := NormalizeProjectGrant(row.Project)
+		if _, exists := canonicalByGrant[key]; exists {
+			canonicalByGrant[key] = ""
+		} else {
+			canonicalByGrant[key] = row.Project
+		}
+	}
+	principalAllowed := make(map[string]struct{}, len(projects))
+	principalAll := false
+	for _, project := range projects {
+		if strings.TrimSpace(project) == "*" {
+			principalAll = true
+			continue
+		}
+		key := NormalizeProjectGrant(project)
+		if canonical := canonicalByGrant[key]; key != "" && canonical != "" {
+			principalAllowed[canonical] = struct{}{}
+		}
+	}
+
+	allowed := principalAllowed
+	if principalAll {
+		allowed = map[string]struct{}{"*": {}}
+	}
+
+	if len(allowed) == 0 {
+		model = dashboardReadModel{projects: []DashboardProjectRow{}, contributors: []DashboardContributorRow{}, projectDetails: map[string]DashboardProjectDetail{}}
+	} else if _, all := allowed["*"]; !all {
+		model = model.scoped(allowed)
+	}
+	return &DashboardScopedStore{base: cs, model: model, allowed: allowed}, nil
+}
+
+func (s *DashboardScopedStore) scopedProject(project string) (string, error) {
+	project, _ = store.NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return "", ErrDashboardProjectInvalid
+	}
+	if _, all := s.allowed["*"]; !all {
+		if _, ok := s.allowed[project]; !ok {
+			return "", ErrDashboardProjectForbidden
+		}
+	}
+	return project, nil
+}
+
+func (s *DashboardScopedStore) scopedProjectFilter(project string) (string, error) {
+	if strings.TrimSpace(project) == "" {
+		return "", nil
+	}
+	return s.scopedProject(project)
+}
+
+func (s *DashboardScopedStore) ListProjects(query string) ([]DashboardProjectRow, error) {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return append([]DashboardProjectRow(nil), s.model.projects...), nil
+	}
+	rows := make([]DashboardProjectRow, 0)
+	for _, row := range s.model.projects {
+		if strings.Contains(strings.ToLower(row.Project), query) {
+			rows = append(rows, row)
+		}
+	}
+	return rows, nil
+}
+
+func (s *DashboardScopedStore) ProjectDetail(project string) (DashboardProjectDetail, error) {
+	project, err := s.scopedProject(project)
+	if err != nil {
+		return DashboardProjectDetail{}, err
+	}
+	detail, ok := s.model.projectDetails[project]
+	if !ok {
+		return DashboardProjectDetail{}, fmt.Errorf("%w: %s", ErrDashboardProjectNotFound, project)
+	}
+	return detail, nil
+}
+
+func (s *DashboardScopedStore) ListContributors(query string) ([]DashboardContributorRow, error) {
+	return s.model.listContributors(query), nil
+}
+
+func (s *DashboardScopedStore) ListRecentSessions(project, query string, limit int) ([]DashboardSessionRow, error) {
+	project, err := s.scopedProjectFilter(project)
+	if err != nil {
+		return nil, err
+	}
+	if project != "" {
+		if _, ok := s.model.projectDetails[project]; !ok {
+			return nil, fmt.Errorf("%w: %s", ErrDashboardProjectNotFound, project)
+		}
+	}
+	rows := s.model.filterSessions(project, query)
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+func (s *DashboardScopedStore) ListRecentObservations(project, query string, limit int) ([]DashboardObservationRow, error) {
+	project, err := s.scopedProjectFilter(project)
+	if err != nil {
+		return nil, err
+	}
+	if project != "" {
+		if _, ok := s.model.projectDetails[project]; !ok {
+			return nil, fmt.Errorf("%w: %s", ErrDashboardProjectNotFound, project)
+		}
+	}
+	rows := s.model.filterObservations(project, query)
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+func (s *DashboardScopedStore) ListRecentPrompts(project, query string, limit int) ([]DashboardPromptRow, error) {
+	project, err := s.scopedProjectFilter(project)
+	if err != nil {
+		return nil, err
+	}
+	if project != "" {
+		if _, ok := s.model.projectDetails[project]; !ok {
+			return nil, fmt.Errorf("%w: %s", ErrDashboardProjectNotFound, project)
+		}
+	}
+	rows := s.model.filterPrompts(project, query)
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+func dashboardPage[T any](rows []T, limit, offset int) ([]T, int) {
+	total := len(rows)
+	if offset > total {
+		return []T{}, total
+	}
+	end := offset + limit
+	if end > total || limit <= 0 {
+		end = total
+	}
+	return rows[offset:end], total
+}
+
+func (s *DashboardScopedStore) ListProjectsPaginated(query string, limit, offset int) ([]DashboardProjectRow, int, error) {
+	rows, err := s.ListProjects(query)
+	if err != nil {
+		return nil, 0, err
+	}
+	page, total := dashboardPage(rows, limit, offset)
+	return page, total, nil
+}
+
+func (s *DashboardScopedStore) ListRecentObservationsPaginated(project, query, obsType string, limit, offset int) ([]DashboardObservationRow, int, error) {
+	rows, err := s.ListRecentObservations(project, query, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	if obsType != "" {
+		filtered := make([]DashboardObservationRow, 0, len(rows))
+		for _, row := range rows {
+			if strings.EqualFold(row.Type, strings.TrimSpace(obsType)) {
+				filtered = append(filtered, row)
+			}
+		}
+		rows = filtered
+	}
+	page, total := dashboardPage(rows, limit, offset)
+	return page, total, nil
+}
+
+func (s *DashboardScopedStore) ListRecentSessionsPaginated(project, query string, limit, offset int) ([]DashboardSessionRow, int, error) {
+	rows, err := s.ListRecentSessions(project, query, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	page, total := dashboardPage(rows, limit, offset)
+	return page, total, nil
+}
+
+func (s *DashboardScopedStore) ListRecentPromptsPaginated(project, query string, limit, offset int) ([]DashboardPromptRow, int, error) {
+	rows, err := s.ListRecentPrompts(project, query, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	page, total := dashboardPage(rows, limit, offset)
+	return page, total, nil
+}
+
+func (s *DashboardScopedStore) ListContributorsPaginated(query string, limit, offset int) ([]DashboardContributorRow, int, error) {
+	rows, err := s.ListContributors(query)
+	if err != nil {
+		return nil, 0, err
+	}
+	page, total := dashboardPage(rows, limit, offset)
+	return page, total, nil
+}
+
+func (s *DashboardScopedStore) GetSessionDetail(project, sessionID string) (DashboardSessionRow, []DashboardObservationRow, []DashboardPromptRow, error) {
+	detail, err := s.ProjectDetail(project)
+	if err != nil {
+		return DashboardSessionRow{}, nil, nil, err
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	for _, session := range detail.Sessions {
+		if session.SessionID != sessionID {
+			continue
+		}
+		var observations []DashboardObservationRow
+		for _, observation := range detail.Observations {
+			if observation.SessionID == sessionID {
+				observations = append(observations, observation)
+			}
+		}
+		var prompts []DashboardPromptRow
+		for _, prompt := range detail.Prompts {
+			if prompt.SessionID == sessionID {
+				prompts = append(prompts, prompt)
+			}
+		}
+		return session, observations, prompts, nil
+	}
+	return DashboardSessionRow{}, nil, nil, fmt.Errorf("%w: session %s in project %s", ErrDashboardSessionNotFound, sessionID, detail.Project)
+}
+
+func (s *DashboardScopedStore) GetObservationDetail(project, sessionID, syncID string) (DashboardObservationRow, DashboardSessionRow, []DashboardObservationRow, error) {
+	detail, err := s.ProjectDetail(project)
+	if err != nil {
+		return DashboardObservationRow{}, DashboardSessionRow{}, nil, err
+	}
+	sessionID, syncID = strings.TrimSpace(sessionID), strings.TrimSpace(syncID)
+	for _, observation := range detail.Observations {
+		if observation.SessionID != sessionID || observation.SyncID != syncID {
+			continue
+		}
+		var session DashboardSessionRow
+		for _, candidate := range detail.Sessions {
+			if candidate.SessionID == sessionID {
+				session = candidate
+				break
+			}
+		}
+		var related []DashboardObservationRow
+		for _, candidate := range detail.Observations {
+			if candidate.SessionID == sessionID && candidate.SyncID != syncID {
+				related = append(related, candidate)
+			}
+		}
+		return observation, session, related, nil
+	}
+	return DashboardObservationRow{}, DashboardSessionRow{}, nil, fmt.Errorf("%w: observation %s/%s in project %s", ErrDashboardObservationNotFound, sessionID, syncID, detail.Project)
+}
+
+func (s *DashboardScopedStore) GetPromptDetail(project, sessionID, syncID string) (DashboardPromptRow, DashboardSessionRow, []DashboardPromptRow, error) {
+	detail, err := s.ProjectDetail(project)
+	if err != nil {
+		return DashboardPromptRow{}, DashboardSessionRow{}, nil, err
+	}
+	sessionID, syncID = strings.TrimSpace(sessionID), strings.TrimSpace(syncID)
+	for _, prompt := range detail.Prompts {
+		if prompt.SessionID != sessionID || prompt.SyncID != syncID {
+			continue
+		}
+		var session DashboardSessionRow
+		for _, candidate := range detail.Sessions {
+			if candidate.SessionID == sessionID {
+				session = candidate
+				break
+			}
+		}
+		var related []DashboardPromptRow
+		for _, candidate := range detail.Prompts {
+			if candidate.SessionID == sessionID && candidate.SyncID != syncID {
+				related = append(related, candidate)
+			}
+		}
+		return prompt, session, related, nil
+	}
+	return DashboardPromptRow{}, DashboardSessionRow{}, nil, fmt.Errorf("%w: prompt %s/%s in project %s", ErrDashboardPromptNotFound, sessionID, syncID, detail.Project)
+}
+
+func (s *DashboardScopedStore) GetContributorDetail(name string) (DashboardContributorRow, []DashboardSessionRow, []DashboardObservationRow, []DashboardPromptRow, error) {
+	name = strings.TrimSpace(name)
+	var contributor DashboardContributorRow
+	for _, row := range s.model.contributors {
+		if strings.EqualFold(strings.TrimSpace(row.CreatedBy), name) {
+			contributor = row
+			break
+		}
+	}
+	if contributor.CreatedBy == "" {
+		return DashboardContributorRow{}, nil, nil, nil, fmt.Errorf("%w: contributor %s", ErrDashboardContributorNotFound, name)
+	}
+	var sessions []DashboardSessionRow
+	var observations []DashboardObservationRow
+	var prompts []DashboardPromptRow
+	for _, detail := range s.model.projectDetails {
+		found := false
+		for _, row := range detail.Contributors {
+			if strings.EqualFold(strings.TrimSpace(row.CreatedBy), name) {
+				found = true
+				break
+			}
+		}
+		if found {
+			sessions = append(sessions, detail.Sessions...)
+			observations = append(observations, detail.Observations...)
+			prompts = append(prompts, detail.Prompts...)
+		}
+	}
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].StartedAt > sessions[j].StartedAt })
+	sort.Slice(observations, func(i, j int) bool { return observations[i].CreatedAt > observations[j].CreatedAt })
+	sort.Slice(prompts, func(i, j int) bool { return prompts[i].CreatedAt > prompts[j].CreatedAt })
+	return contributor, sessions, observations, prompts, nil
+}
+
+func (s *DashboardScopedStore) AdminOverview() (DashboardAdminOverview, error) {
+	return s.model.admin, nil
+}
+
+func (s *DashboardScopedStore) ListDistinctTypes() ([]string, error) {
+	seen := make(map[string]struct{})
+	for _, detail := range s.model.projectDetails {
+		for _, observation := range detail.Observations {
+			if kind := strings.TrimSpace(observation.Type); kind != "" {
+				seen[kind] = struct{}{}
+			}
+		}
+	}
+	types := make([]string, 0, len(seen))
+	for kind := range seen {
+		types = append(types, kind)
+	}
+	sort.Strings(types)
+	return types, nil
+}
+
+func (s *DashboardScopedStore) SystemHealth() (DashboardSystemHealth, error) {
+	health, err := s.base.SystemHealth()
+	if err != nil {
+		return DashboardSystemHealth{}, err
+	}
+	health.Projects = len(s.model.projects)
+	health.Contributors = len(s.model.contributors)
+	health.Chunks = s.model.admin.Chunks
+	health.Sessions, health.Observations, health.Prompts = 0, 0, 0
+	for _, detail := range s.model.projectDetails {
+		health.Sessions += len(detail.Sessions)
+		health.Observations += len(detail.Observations)
+		health.Prompts += len(detail.Prompts)
+	}
+	return health, nil
+}
+
+func (s *DashboardScopedStore) ListProjectSyncControls() ([]ProjectSyncControl, error) {
+	controls, err := s.base.ListProjectSyncControls()
+	if err != nil {
+		return nil, err
+	}
+	return s.filterProjectSyncControls(controls)
+}
+
+func (s *DashboardScopedStore) filterProjectSyncControls(controls []ProjectSyncControl) ([]ProjectSyncControl, error) {
+	filtered := make([]ProjectSyncControl, 0, len(controls))
+	for _, control := range controls {
+		if _, err := s.scopedProject(control.Project); err != nil {
+			if errors.Is(err, ErrDashboardProjectForbidden) {
+				continue
+			}
+			return nil, fmt.Errorf("cloudstore: validate dashboard sync control project %q: %w", control.Project, err)
+		}
+		filtered = append(filtered, control)
+	}
+	return filtered, nil
+}
+
+func (s *DashboardScopedStore) GetProjectSyncControl(project string) (*ProjectSyncControl, error) {
+	project, err := s.scopedProject(project)
+	if err != nil {
+		return nil, err
+	}
+	return s.base.GetProjectSyncControl(project)
+}
+
+func (s *DashboardScopedStore) SetProjectSyncEnabled(project string, enabled bool, updatedBy, reason string) error {
+	project, err := s.scopedProject(project)
+	if err != nil {
+		return err
+	}
+	return s.base.SetProjectSyncEnabled(project, enabled, updatedBy, reason)
+}
+
+func (s *DashboardScopedStore) IsProjectSyncEnabled(project string) (bool, error) {
+	project, err := s.scopedProject(project)
+	if err != nil {
+		return false, err
+	}
+	return s.base.IsProjectSyncEnabled(project)
+}
+
+// Audit entries are not project-addressable, so a principal-scoped dashboard
+// view returns no entries rather than exposing cross-project audit metadata.
+func (s *DashboardScopedStore) ListAuditEntriesPaginated(context.Context, AuditFilter, int, int) ([]DashboardAuditRow, int, error) {
+	return []DashboardAuditRow{}, 0, nil
+}
+
 type dashboardChunkRow struct {
 	chunkID   string
 	project   string
@@ -1102,24 +1563,8 @@ func (cs *CloudStore) loadChunkRows(project string) ([]dashboardChunkRow, error)
 	project = strings.TrimSpace(project)
 	query := `SELECT chunk_id, project_name, created_by, created_at, payload FROM cloud_chunks`
 	args := []any{}
-	if project == "" && !cs.dashboardAllowedAll && len(cs.dashboardAllowedScopes) > 0 {
-		allowed := make([]string, 0, len(cs.dashboardAllowedScopes))
-		for name := range cs.dashboardAllowedScopes {
-			allowed = append(allowed, name)
-		}
-		sort.Strings(allowed)
-		query += ` WHERE project_name = ANY($1)`
-		args = append(args, allowed)
-	}
+	// Cache inputs are permission-neutral; public readers apply credential scope.
 	if project != "" {
-		if !cs.dashboardAllowedAll && len(cs.dashboardAllowedScopes) > 0 {
-			if _, ok := cs.dashboardAllowedScopes[project]; !ok {
-				return []dashboardChunkRow{}, nil
-			}
-		}
-		if len(args) > 0 {
-			return nil, fmt.Errorf("cloudstore: internal dashboard query invariant violated")
-		}
 		query += ` WHERE project_name = $1`
 		args = append(args, project)
 	}
@@ -1159,24 +1604,8 @@ func (cs *CloudStore) loadMutationRows(project string) ([]dashboardMutationRow, 
 	project = strings.TrimSpace(project)
 	query := `SELECT seq, project, entity, entity_key, op, payload::text, occurred_at FROM cloud_mutations`
 	args := []any{}
-	if project == "" && !cs.dashboardAllowedAll && len(cs.dashboardAllowedScopes) > 0 {
-		allowed := make([]string, 0, len(cs.dashboardAllowedScopes))
-		for name := range cs.dashboardAllowedScopes {
-			allowed = append(allowed, name)
-		}
-		sort.Strings(allowed)
-		query += ` WHERE project = ANY($1)`
-		args = append(args, allowed)
-	}
+	// Cache inputs are permission-neutral; public readers apply credential scope.
 	if project != "" {
-		if !cs.dashboardAllowedAll && len(cs.dashboardAllowedScopes) > 0 {
-			if _, ok := cs.dashboardAllowedScopes[project]; !ok {
-				return []dashboardMutationRow{}, nil
-			}
-		}
-		if len(args) > 0 {
-			return nil, fmt.Errorf("cloudstore: internal dashboard mutation query invariant violated")
-		}
 		query += ` WHERE project = $1`
 		args = append(args, project)
 	}

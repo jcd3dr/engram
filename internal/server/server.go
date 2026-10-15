@@ -5,6 +5,7 @@
 package server
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/subtle"
 	"database/sql"
@@ -13,17 +14,23 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/diagnostic"
-	projectpkg "github.com/Gentleman-Programming/engram/internal/project"
-	"github.com/Gentleman-Programming/engram/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/diagnostic"
+	projectpkg "github.com/Gentleman-Programming/engram/v3/internal/project"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
+
+var observedGenerationError = (*store.Store).GenerationError
 
 var loadServerStats = func(s *store.Store) (*store.Stats, error) {
 	return s.Stats()
@@ -63,13 +70,21 @@ type SemanticRunnerFactory func(name string) (store.SemanticRunner, error)
 type SemanticPromptBuilder func(a, b store.ObservationSnippet) string
 
 type Server struct {
-	store      *store.Store
-	mux        *http.ServeMux
-	port       int
-	listen     func(network, address string) (net.Listener, error)
-	serve      func(net.Listener, http.Handler) error
-	onWrite    func() // called after successful local writes (for autosync notification)
-	syncStatus SyncStatusProvider
+	httpServer            *http.Server
+	generationInvalidated chan struct{}
+	generationOnce        sync.Once
+	store                 *store.Store
+	mux                   *http.ServeMux
+	port                  int
+	listen                func(network, address string) (net.Listener, error)
+	serve                 func(net.Listener, http.Handler) error
+	socketPath            string
+	listener              net.Listener
+	socketInfo            os.FileInfo
+	closeMu               sync.Mutex
+	closed                bool
+	onWrite               func() // called after successful local writes (for autosync notification)
+	syncStatus            SyncStatusProvider
 
 	// runnerFactory resolves a SemanticRunner by CLI name (read from ENGRAM_AGENT_CLI).
 	// When nil, semantic=true requests fail with 500.
@@ -77,19 +92,43 @@ type Server struct {
 	// promptBuilder constructs LLM prompts for semantic scan pairs.
 	// When nil and semantic=true, a no-op builder is used (returns empty string).
 	promptBuilder SemanticPromptBuilder
+	// version is reported by GET /health and defaults to "dev" for local builds.
+	version           string
+	instanceID        string
+	sessionOwnedToken string
+	onReady           func(net.Addr) error
 }
 
 func New(s *store.Store, port int) *Server {
-	srv := &Server{store: s, port: port, listen: net.Listen, serve: http.Serve}
+	srv := &Server{store: s, port: port, listen: net.Listen, version: "dev", generationInvalidated: make(chan struct{}, 1)}
+	srv.httpServer = &http.Server{Handler: srv.Handler()}
+	srv.serve = func(ln net.Listener, h http.Handler) error { return srv.httpServer.Serve(ln) }
+	if s != nil {
+		srv.instanceID = s.InstanceID()
+	}
 	srv.mux = http.NewServeMux()
 	srv.routes()
 	return srv
 }
 
+// SetSessionOwnedToken enables authentication on the entire handler, including health.
+// Configure before Start; the private token is immutable for this child's lifetime.
+func (s *Server) SetSessionOwnedToken(token string) { s.sessionOwnedToken = token }
+
+// SetOnReady publishes the bound listener before serving, never before bind succeeds.
+func (s *Server) SetOnReady(fn func(net.Addr) error) { s.onReady = fn }
+
+type ownedAuthKey struct{}
+
 // SetOnWrite configures a callback invoked after every successful local write.
 // This is used to notify autosync.Manager via NotifyDirty().
 func (s *Server) SetOnWrite(fn func()) {
 	s.onWrite = fn
+}
+
+// SetVersion sets the release version reported by GET /health.
+func (s *Server) SetVersion(v string) {
+	s.version = v
 }
 
 // SetSyncStatus configures the sync status provider for the /sync/status endpoint.
@@ -107,6 +146,14 @@ func (s *Server) SetRunnerFactory(fn SemanticRunnerFactory) {
 // When not set, an empty-string builder is used (valid for tests, not production).
 func (s *Server) SetPromptBuilder(fn SemanticPromptBuilder) {
 	s.promptBuilder = fn
+}
+
+// SetSocketPath configures an exclusive POSIX Unix-domain socket listener.
+// An empty path preserves the default loopback TCP listener.
+func (s *Server) SetSocketPath(path string) {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	s.socketPath = strings.TrimSpace(path)
 }
 
 // notifyWrite calls the onWrite callback if configured (best-effort, non-blocking).
@@ -127,6 +174,10 @@ func (s *Server) notifyWrite() {
 // does not need to restart when the variable changes.
 func requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(ownedAuthKey{}) == true {
+			h(w, r)
+			return
+		}
 		token := os.Getenv("ENGRAM_HTTP_TOKEN")
 		if token == "" {
 			// No token configured → open access (zero-config default).
@@ -156,78 +207,330 @@ func requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// writeOwnershipError reports an ownership failure the client can act on, and
+// names the concrete repair. The repair is a CLI path that reaches the store
+// directly, so it stays available in a zero-config install where the HTTP
+// rescue endpoint is not served. Returns false when err is not an ownership
+// failure and the caller should keep its own handling.
+func writeOwnershipError(w http.ResponseWriter, sessionID string, err error) bool {
+	code := ""
+	switch {
+	case errors.Is(err, store.ErrProjectOwnershipAmbiguous):
+		code = "project_ownership_ambiguous"
+	case errors.Is(err, store.ErrProjectRequired):
+		code = "project_ownership_required"
+	default:
+		return false
+	}
+	remedy := store.RescueOwnershipCommand + " --project <name>"
+	if strings.TrimSpace(sessionID) != "" {
+		remedy += " --session " + sessionID
+	}
+	jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{
+		"code":   code,
+		"remedy": remedy,
+	})
+	return true
+}
+
+// requireConfiguredAuth rejects requests when the server token is not configured.
+// It is reserved for endpoints that must never use the zero-config auth default.
+// It is not the only way to repair ownership: store.RescueOwnershipCommand does
+// the same work locally without any server token.
+func requireConfiguredAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(ownedAuthKey{}) == true {
+			h(w, r)
+			return
+		}
+		if os.Getenv("ENGRAM_HTTP_TOKEN") == "" {
+			jsonError(w, http.StatusServiceUnavailable, "server authorization is not configured")
+			return
+		}
+		requireAuth(h)(w, r)
+	}
+}
+
 func (s *Server) Start() error {
+	s.closeMu.Lock()
+	if s.closed {
+		s.closeMu.Unlock()
+		return nil
+	}
+	socketPath := s.socketPath
+	s.closeMu.Unlock()
+
+	network := "tcp"
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
+	if socketPath != "" {
+		var err error
+		socketPath, err = prepareUnixSocket(socketPath)
+		if err != nil {
+			return err
+		}
+		network = "unix"
+		addr = socketPath
+	}
 	listenFn := s.listen
 	if listenFn == nil {
 		listenFn = net.Listen
 	}
 	serveFn := s.serve
 	if serveFn == nil {
-		serveFn = http.Serve
+		serveFn = func(ln net.Listener, h http.Handler) error { return s.httpServer.Serve(ln) }
 	}
 
-	ln, err := listenFn("tcp", addr)
+	var (
+		ln         net.Listener
+		socketInfo os.FileInfo
+		err        error
+	)
+	if socketPath != "" {
+		ln, socketInfo, err = listenSecureUnixSocket(socketPath)
+	} else {
+		ln, err = listenFn(network, addr)
+	}
 	if err != nil {
+		if s.sessionOwnedToken == "" && socketPath == "" && isAddressInUse(err) {
+			if s.instanceOwnsPort() {
+				log.Printf("[engram] HTTP server did not bind on %s: an existing instance owns the port", addr)
+				return nil
+			}
+			return fmt.Errorf("engram server: listen %s: already owned by a different or legacy instance", addr)
+		}
 		return fmt.Errorf("engram server: listen %s: %w", addr, err)
 	}
+
+	s.closeMu.Lock()
+	if s.closed {
+		s.closeMu.Unlock()
+		_ = ln.Close()
+		removeOwnedUnixSocket(socketPath, socketInfo)
+		return nil
+	}
+	s.listener = ln
+	s.socketPath = socketPath
+	s.socketInfo = socketInfo
+	s.closeMu.Unlock()
+	defer s.Close()
+
+	if s.onReady != nil {
+		if err := s.onReady(ln.Addr()); err != nil {
+			return err
+		}
+	}
 	log.Printf("[engram] HTTP server listening on %s", addr)
-	return serveFn(ln, s.mux)
+	err = serveFn(ln, s.Handler())
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func isAddressInUse(err error) bool {
+	message := strings.ToLower(err.Error())
+	return errors.Is(err, syscall.EADDRINUSE) || strings.Contains(message, "address already in use") || strings.Contains(message, "only one usage of each socket address")
+}
+
+func (s *Server) instanceOwnsPort() bool {
+	if s.instanceID == "" {
+		return false
+	}
+	client := http.Client{Timeout: 500 * time.Millisecond}
+	for attempt := 0; attempt < 5; attempt++ {
+		response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", s.port))
+		if err == nil {
+			var health struct {
+				InstanceID string `json:"instance_id"`
+			}
+			err = json.NewDecoder(response.Body).Decode(&health)
+			_ = response.Body.Close()
+			if err == nil && health.InstanceID == s.instanceID {
+				return true
+			}
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+// Close stops the active listener and removes only the socket created by this
+// server. It is safe to call repeatedly.
+func (s *Server) Close() error {
+	s.closeMu.Lock()
+	if s.closed {
+		s.closeMu.Unlock()
+		return nil
+	}
+	s.closed = true
+	ln := s.listener
+	s.listener = nil
+	socketPath := s.socketPath
+	socketInfo := s.socketInfo
+	s.socketInfo = nil
+	s.closeMu.Unlock()
+
+	if ln == nil {
+		return nil
+	}
+	err := ln.Close()
+	if errors.Is(err, net.ErrClosed) {
+		err = nil
+	}
+	if removeErr := removeOwnedUnixSocket(socketPath, socketInfo); removeErr != nil && err == nil {
+		err = removeErr
+	}
+	return err
+}
+
+func prepareUnixSocket(socketPath string) (string, error) {
+	if socketPath == "" || socketPath == "." {
+		return "", fmt.Errorf("engram server: socket path is required")
+	}
+	canonicalPath, err := secureUnixSocketPath(socketPath)
+	if err != nil {
+		return "", err
+	}
+	parent := filepath.Dir(canonicalPath)
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		return "", fmt.Errorf("engram server: socket parent %q: %w", parent, err)
+	}
+	if !parentInfo.IsDir() {
+		return "", fmt.Errorf("engram server: socket parent %q is not a directory", parent)
+	}
+
+	info, err := os.Lstat(canonicalPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return canonicalPath, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("engram server: inspect socket %q: %w", canonicalPath, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return "", fmt.Errorf("engram server: socket path %q exists and is not a Unix socket", canonicalPath)
+	}
+
+	conn, err := net.DialTimeout("unix", canonicalPath, 250*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		return "", fmt.Errorf("engram server: socket %q is already in use", canonicalPath)
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		if err := removeOwnedUnixSocket(canonicalPath, info); err != nil {
+			return "", fmt.Errorf("engram server: remove stale socket %q: %w", canonicalPath, err)
+		}
+		return canonicalPath, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return canonicalPath, nil
+	}
+	return "", fmt.Errorf("engram server: cannot verify socket %q is stale: %w", canonicalPath, err)
+}
+
+func removeOwnedUnixSocket(socketPath string, expected os.FileInfo) error {
+	if socketPath == "" || expected == nil {
+		return nil
+	}
+	current, err := os.Lstat(socketPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if current.Mode()&os.ModeSocket == 0 || !os.SameFile(expected, current) {
+		return nil
+	}
+	return os.Remove(socketPath)
+}
+
+// GenerationInvalidated notifies the process owner once without blocking requests.
+func (s *Server) GenerationInvalidated() <-chan struct{} {
+	return s.generationInvalidated
+}
+
+// Shutdown drains active requests until ctx expires, then closes connections.
+// Call it from the process owner, never from a request handler.
+func (s *Server) Shutdown(ctx context.Context) error {
+	err := s.httpServer.Shutdown(ctx)
+	if err != nil {
+		_ = s.httpServer.Close()
+	}
+	return errors.Join(err, s.Close())
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.sessionOwnedToken != "" {
+			if !hmac.Equal([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.sessionOwnedToken)) {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="engram"`)
+				jsonError(w, http.StatusUnauthorized, "authorization required")
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), ownedAuthKey{}, true))
+		}
+		if timing := beginHTTPWriteTiming(r); timing != nil {
+			writer := &timedResponseWriter{ResponseWriter: w}
+			r = r.WithContext(context.WithValue(r.Context(), httpWriteTimingKey{}, timing))
+			s.mux.ServeHTTP(writer, r)
+			timing.finish(writer)
+		} else {
+			s.mux.ServeHTTP(w, r)
+		}
+		if errors.Is(observedGenerationError(s.store), store.ErrDatabaseGenerationChanged) {
+			s.generationOnce.Do(func() {
+				select {
+				case s.generationInvalidated <- struct{}{}:
+				default:
+				}
+			})
+		}
+	})
 }
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("GET /compatibility", requireAuth(s.handleCompatibility))
 	s.mux.HandleFunc("GET /health", s.handleHealth)
+	// Pi runtime declarations and these route bindings share one Go authority.
+	s.registerRuntimeRoutes()
 
 	// Sessions
-	s.mux.HandleFunc("POST /sessions", s.handleCreateSession)
-	s.mux.HandleFunc("POST /sessions/{id}/end", s.handleEndSession)
 	s.mux.HandleFunc("GET /sessions/recent", s.handleRecentSessions)
 	s.mux.HandleFunc("GET /sessions/{id}", s.handleGetSession)
 	s.mux.HandleFunc("DELETE /sessions/{id}", requireAuth(s.handleDeleteSession))
 
 	// Observations
-	s.mux.HandleFunc("POST /observations", s.handleAddObservation)
 	s.mux.HandleFunc("GET /observations", s.handleListObservations)
-	s.mux.HandleFunc("POST /observations/passive", s.handlePassiveCapture)
 	s.mux.HandleFunc("GET /observations/recent", s.handleRecentObservations)
-	s.mux.HandleFunc("PATCH /observations/{id}", s.handleUpdateObservation)
-	s.mux.HandleFunc("DELETE /observations/{id}", requireAuth(s.handleDeleteObservation))
+	// Runtime registry preserves save-result, pin, update and delete auth policy.
+	// Topic-key suggestion is read-only and remains open under the local HTTP policy.
 
 	// Search
-	s.mux.HandleFunc("GET /search", s.handleSearch)
 
 	// Timeline
-	s.mux.HandleFunc("GET /timeline", s.handleTimeline)
-	s.mux.HandleFunc("GET /observations/{id}", s.handleGetObservation)
 
 	// Lifecycle review
-	s.mux.HandleFunc("GET /review", s.handleReviewList)
-	s.mux.HandleFunc("POST /review/mark_reviewed", s.handleReviewMarkReviewed)
 
 	// Prompts
-	s.mux.HandleFunc("POST /prompts", s.handleAddPrompt)
 	s.mux.HandleFunc("GET /prompts/recent", s.handleRecentPrompts)
 	s.mux.HandleFunc("GET /prompts/search", s.handleSearchPrompts)
 	s.mux.HandleFunc("DELETE /prompts/{id}", requireAuth(s.handleDeletePrompt))
 
 	// Context
-	s.mux.HandleFunc("GET /context", s.handleContext)
 
 	// Export / Import — sensitive: full data read and bulk mutation.
 	s.mux.HandleFunc("GET /export", requireAuth(s.handleExport))
 	s.mux.HandleFunc("POST /import", requireAuth(s.handleImport))
 
 	// Stats / diagnostics
-	s.mux.HandleFunc("GET /stats", s.handleStats)
-	s.mux.HandleFunc("GET /doctor", s.handleDoctor)
+	// Runtime registry binds stats, project listing and diagnostics unchanged.
 
-	// Project detection / migration
-	s.mux.HandleFunc("GET /project/current", s.handleCurrentProject)
-	s.mux.HandleFunc("POST /projects/migrate", requireAuth(s.handleMigrateProject))
+	// Project detection / ownership rescue
+	s.mux.HandleFunc("POST /projects/rescue-ownership", requireConfiguredAuth(s.handleRescueProjectOwnership))
+	// Deprecated compatibility alias for older clients.
+	s.mux.HandleFunc("POST /projects/migrate", requireConfiguredAuth(s.handleRescueProjectOwnership))
 
 	// Sync status (degraded-state visibility for autosync)
 	s.mux.HandleFunc("GET /sync/status", s.handleSyncStatus)
@@ -237,8 +540,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /conflicts/stats", s.handleConflictsStats)
 	s.mux.HandleFunc("GET /conflicts/deferred", s.handleListDeferred)
 	s.mux.HandleFunc("POST /conflicts/scan", s.handleScanConflicts)
-	s.mux.HandleFunc("POST /conflicts/judge", s.handleJudgeConflict)
-	s.mux.HandleFunc("POST /conflicts/compare", s.handleCompareMemories)
 	s.mux.HandleFunc("POST /conflicts/deferred/replay", s.handleReplayDeferred)
 	s.mux.HandleFunc("GET /conflicts/{relation_id}", s.handleGetConflict)
 }
@@ -246,18 +547,28 @@ func (s *Server) routes() {
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if _, err := loadServerStats(s.store); err != nil {
+		jsonError(w, http.StatusInternalServerError, "health check failed")
+		return
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"service": "engram",
-		"version": "0.1.0",
+		"status":       "ok",
+		"service":      "engram",
+		"version":      s.version,
+		"instance_id":  s.instanceID,
+		"capabilities": map[string]bool{"isolated_session_registration": true, "root_session_resume": true, "runtime_session_resolution": true},
 	})
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID        string `json:"id"`
-		Project   string `json:"project"`
-		Directory string `json:"directory"`
+		ID                string                   `json:"id"`
+		Project           string                   `json:"project"`
+		Directory         string                   `json:"directory"`
+		OwnershipMode     string                   `json:"ownership_mode"`
+		Resume            bool                     `json:"resume"`
+		Isolated          bool                     `json:"isolated"`
+		ProjectProvenance *store.ProjectProvenance `json:"project_provenance,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -268,13 +579,53 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.CreateSession(body.ID, body.Project, body.Directory); err != nil {
-		jsonError(w, http.StatusInternalServerError, err.Error())
+	if err := body.ProjectProvenance.Validate(); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	mode := body.OwnershipMode
+	if mode == "" {
+		mode = store.SessionOwnershipShared
+	}
+	if body.Isolated && (mode != store.SessionOwnershipProjectOwned || strings.TrimSpace(body.Directory) != "") {
+		jsonError(w, http.StatusBadRequest, "isolated registration requires project_owned ownership and an empty directory")
+		return
+	}
+	effectiveID := body.ID
+	timings := requestWriteTimings(r)
+	var err error
+	effectiveID, err = s.store.RegisterSessionWithProjectProvenance(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode, body.Resume, body.Isolated, body.ProjectProvenance, timings)
+	if err != nil {
+		var conflict *store.SessionProjectConflictError
+		switch {
+		case errors.Is(err, store.ErrSessionIsolationConflict):
+			jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{"code": "session_isolation_conflict"})
+		case errors.Is(err, store.ErrSessionAlreadyEnded):
+			jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{
+				"code":       "session_already_ended",
+				"session_id": body.ID,
+			})
+		case errors.As(err, &conflict):
+			jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{
+				"code":              "session_project_conflict",
+				"session_id":        conflict.SessionID,
+				"owner_project":     conflict.OwnerProject,
+				"requested_project": conflict.RequestedProject,
+			})
+		case errors.Is(err, store.ErrInvalidSessionOwnershipMode):
+			jsonError(w, http.StatusBadRequest, err.Error())
+		default:
+			jsonError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 
 	s.notifyWrite()
-	jsonResponse(w, http.StatusCreated, map[string]string{"id": body.ID, "status": "created"})
+	ack := map[string]string{"id": effectiveID, "status": "created"}
+	if effectiveID != body.ID {
+		ack["resumed_from"] = body.ID
+	}
+	jsonResponse(w, http.StatusCreated, ack)
 }
 
 func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
@@ -295,13 +646,20 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRecentSessions(w http.ResponseWriter, r *http.Request) {
-	project := r.URL.Query().Get("project")
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
 	limit := queryInt(r, "limit", 5)
 
-	sessions, err := s.store.RecentSessions(project, limit)
+	sessions, err := s.store.RecentSessions(resolved.Project, limit)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if sessions == nil {
+		sessions = []store.SessionSummary{}
 	}
 
 	jsonResponse(w, http.StatusOK, sessions)
@@ -318,31 +676,117 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jsonResponse(w, http.StatusOK, session)
-}
-
-func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
-	var body store.AddObservationParams
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	if body.SessionID == "" || body.Title == "" || body.Content == "" {
-		jsonError(w, http.StatusBadRequest, "session_id, title, and content are required")
-		return
-	}
-	if !s.validateSessionProject(w, body.SessionID, body.Project) {
-		return
-	}
-
-	id, err := s.store.AddObservation(body)
+	provenance, err := s.store.CaptureProjectProvenance("session", session.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	jsonResponse(w, http.StatusOK, struct {
+		*store.Session
+		ProjectProvenance *store.ProjectProvenance `json:"project_provenance,omitempty"`
+	}{session, provenance})
+}
 
-	s.notifyWrite()
-	jsonResponse(w, http.StatusCreated, map[string]any{"id": id, "status": "saved"})
+func (s *Server) handleGetObservationSaveResult(w http.ResponseWriter, r *http.Request) {
+	operationID := r.URL.Query().Get("operation_id")
+	if operationID == "" {
+		jsonError(w, http.StatusBadRequest, "operation_id is required")
+		return
+	}
+	observationID, err := s.store.GetObservationSaveResult(operationID)
+	if err != nil {
+		if errors.Is(err, store.ErrObservationOperationExpired) {
+			jsonError(w, http.StatusGone, err.Error())
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if observationID == 0 {
+		jsonErrorWithFields(w, http.StatusNotFound, "no committed result found for operation_id", map[string]any{
+			"code": "observation_save_result_not_found",
+		})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"id": observationID, "status": "committed"})
+}
+
+var capturePromptForSave = (*store.Store).CapturePromptForSave
+
+func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		store.AddObservationParams
+		CapturePrompt *bool  `json:"capture_prompt,omitempty"`
+		CurrentPrompt string `json:"current_prompt,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if err := body.ProjectProvenance.Validate(); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Validate the title before the session lookup so a bad session or project
+	// cannot mask the documented title-validation 400 (#459). A whitespace-only
+	// title survives a raw `== ""` check, so it needs the shared predicate.
+	if err := store.ValidateObservationTitle(body.Title); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.SessionID == "" || body.Content == "" {
+		jsonError(w, http.StatusBadRequest, "session_id and content are required")
+		return
+	}
+	// A committed operation ID reaches the transactional replay path before
+	// session-ownership pre-validation, so a later ownership change cannot
+	// lock out an acknowledged save. Unknown or missing operation IDs still
+	// run the normal pre-validation gate.
+	recorded := false
+	if body.OperationID != "" {
+		var err error
+		recorded, err = s.store.ObservationOperationRecorded(body.OperationID)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if !recorded && !s.validateSessionProject(w, body.SessionID, body.Project) {
+		return
+	}
+
+	body.Timings = requestWriteTimings(r)
+	result, err := s.store.AddObservationWithResult(body.AddObservationParams)
+	if err != nil {
+		// A titleless or contentless observation is a client mistake, not a
+		// server failure.
+		switch {
+		case errors.Is(err, store.ErrObservationTitleRequired),
+			errors.Is(err, store.ErrObservationContentRequired):
+			jsonError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, store.ErrObservationOperationConflict):
+			jsonError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, store.ErrObservationOperationExpired):
+			jsonError(w, http.StatusGone, err.Error())
+		case writeOwnershipError(w, body.SessionID, err):
+		default:
+			jsonError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	if !result.Replayed {
+		if err := capturePromptForSave(s.store, body.CapturePrompt, store.AddPromptParams{
+			SessionID:         body.SessionID,
+			Project:           body.Project,
+			Content:           body.CurrentPrompt,
+			ProjectProvenance: body.ProjectProvenance,
+		}); err != nil {
+			log.Printf("engram: auto prompt capture error (non-fatal): %v", err)
+		}
+		s.notifyWrite()
+	}
+	jsonResponse(w, http.StatusCreated, map[string]any{"id": result.ID, "status": "saved"})
 }
 
 func (s *Server) handlePassiveCapture(w http.ResponseWriter, r *http.Request) {
@@ -359,8 +803,12 @@ func (s *Server) handlePassiveCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	body.Timings = requestWriteTimings(r)
 	result, err := s.store.PassiveCapture(body)
 	if err != nil {
+		if writeOwnershipError(w, body.SessionID, err) {
+			return
+		}
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -380,14 +828,21 @@ func (s *Server) handleListObservations(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleRecentObservations(w http.ResponseWriter, r *http.Request) {
-	project := r.URL.Query().Get("project")
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
 	scope := r.URL.Query().Get("scope")
 	limit := queryInt(r, "limit", 20)
 
-	obs, err := s.store.RecentObservations(project, scope, limit)
+	obs, err := s.store.RecentObservations(resolved.Project, scope, limit)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if obs == nil {
+		obs = []store.Observation{}
 	}
 
 	jsonResponse(w, http.StatusOK, obs)
@@ -395,15 +850,21 @@ func (s *Server) handleRecentObservations(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	params := r.URL.Query()
+	responseFormat := params.Get("response_format")
+	if responseFormat != "" && responseFormat != "compact" {
+		jsonError(w, http.StatusBadRequest, fmt.Sprintf("invalid response_format %q: must be \"compact\"", responseFormat))
+		return
+	}
 	query := params.Get("q")
 	if query == "" {
 		jsonError(w, http.StatusBadRequest, "q parameter is required")
 		return
 	}
 
-	project := params.Get("project")
-	if queryBool(r, "all_projects", false) {
-		project = ""
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
 	}
 
 	matchMode := params.Get("match_mode")
@@ -412,16 +873,38 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.store.Search(query, store.SearchOptions{
+	opts := store.SearchOptions{
 		Type:      params.Get("type"),
-		Project:   project,
+		Project:   resolved.Project,
 		Scope:     params.Get("scope"),
 		Limit:     queryInt(r, "limit", 10),
 		MatchMode: matchMode,
-	})
+	}
+	if responseFormat == "compact" {
+		previews, searchErr := s.store.SearchPreviewsContext(r.Context(), query, opts)
+		if searchErr != nil {
+			jsonError(w, http.StatusInternalServerError, searchErr.Error())
+			return
+		}
+		relations, relationErr := s.store.SearchPreviewRelationsContext(r.Context(), previews)
+		if relationErr != nil {
+			jsonError(w, http.StatusInternalServerError, relationErr.Error())
+			return
+		}
+		summary := fmt.Sprintf("Found %d memories.", len(previews))
+		if len(previews) == 0 {
+			summary = fmt.Sprintf("No memories found for: %q", query)
+		}
+		jsonResponse(w, http.StatusOK, map[string]any{"result": summary, "results": store.CompactSearchProjection(previews, relations)})
+		return
+	}
+	results, err := s.store.Search(query, opts)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if results == nil {
+		results = []store.SearchResult{}
 	}
 
 	jsonResponse(w, http.StatusOK, results)
@@ -441,7 +924,48 @@ func (s *Server) handleGetObservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jsonResponse(w, http.StatusOK, obs)
+	if r.URL.Query().Get("include_history") != "true" {
+		jsonResponse(w, http.StatusOK, obs)
+		return
+	}
+
+	var cursor int64
+	if values, present := r.URL.Query()["history_cursor"]; present {
+		var numeric float64
+		// Decode a JSON number just as MCP does, including integral scientific
+		// notation and its float64 boundary strictly below 2^63.
+		if len(values) == 0 || json.Unmarshal([]byte(values[0]), &numeric) != nil || strings.TrimSpace(values[0]) == "null" || numeric < 0 || math.Trunc(numeric) != numeric || numeric >= 0x1p63 {
+			jsonError(w, http.StatusBadRequest, "history_cursor must be a non-negative integer")
+			return
+		}
+		cursor = int64(numeric)
+	}
+	page, err := s.store.GetObservationVersionPage(id, store.DefaultObservationVersionPageSize, cursor)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to read observation history: %v", err))
+		return
+	}
+	history := make([]map[string]any, 0, len(page.Versions))
+	for _, version := range page.Versions {
+		history = append(history, map[string]any{
+			"version": version.Version, "title": version.Title,
+			"content": version.Content, "created_at": version.CreatedAt,
+		})
+	}
+	response := struct {
+		*store.Observation
+		History            []map[string]any `json:"history"`
+		VersionCount       int              `json:"version_count"`
+		HistoryTruncated   bool             `json:"history_truncated,omitempty"`
+		HistoryFromVersion int              `json:"history_from_version,omitempty"`
+		HistoryCursor      int64            `json:"history_cursor,omitempty"`
+	}{Observation: obs, History: history, VersionCount: page.Total}
+	if page.HasMore {
+		response.HistoryTruncated = true
+		response.HistoryFromVersion = page.Versions[0].Version
+		response.HistoryCursor = page.NextCursor
+	}
+	jsonResponse(w, http.StatusOK, response)
 }
 
 func (s *Server) handleUpdateObservation(w http.ResponseWriter, r *http.Request) {
@@ -458,19 +982,104 @@ func (s *Server) handleUpdateObservation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if body.Type == nil && body.Title == nil && body.Content == nil && body.Project == nil && body.Scope == nil && body.TopicKey == nil {
+	if body.Type == nil && body.Title == nil && body.Content == nil && body.Find == nil && body.Replace == nil && body.Project == nil && body.Scope == nil && body.TopicKey == nil {
 		jsonError(w, http.StatusBadRequest, "at least one field is required")
 		return
 	}
 
-	obs, err := s.store.UpdateObservation(id, body)
+	obs, err := s.store.UpdateObservationForProject(id, r.URL.Query().Get("expected_project"), body)
 	if err != nil {
-		jsonError(w, http.StatusNotFound, err.Error())
+		switch {
+		case errors.Is(err, store.ErrExpectedProjectRequired),
+			errors.Is(err, store.ErrObservationTitleRequired),
+			errors.Is(err, store.ErrObservationContentRequired),
+			errors.Is(err, store.ErrObservationFindReplacePairRequired),
+			errors.Is(err, store.ErrObservationFindReplaceContentConflict),
+			errors.Is(err, store.ErrObservationFindReplaceInputTooLarge),
+			errors.Is(err, store.ErrObservationFindReplaceResultTooLarge),
+			errors.Is(err, store.ErrObservationFindReplaceLegacyContentLarge):
+			jsonError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, store.ErrObservationProjectMismatch),
+			errors.Is(err, store.ErrObservationProjectImmutable):
+			jsonError(w, http.StatusConflict, err.Error())
+		default:
+			jsonError(w, http.StatusNotFound, err.Error())
+		}
 		return
 	}
 
 	s.notifyWrite()
 	jsonResponse(w, http.StatusOK, obs)
+}
+
+func (s *Server) handlePinObservation(w http.ResponseWriter, r *http.Request) {
+	s.handleObservationPinState(w, r, true)
+}
+
+func (s *Server) handleUnpinObservation(w http.ResponseWriter, r *http.Request) {
+	s.handleObservationPinState(w, r, false)
+}
+
+func (s *Server) handleObservationPinState(w http.ResponseWriter, r *http.Request, pinned bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		jsonError(w, http.StatusBadRequest, "invalid observation id")
+		return
+	}
+
+	setPinned := s.store.UnpinObservation
+	if pinned {
+		setPinned = s.store.PinObservation
+	}
+	if err := setPinned(id); err != nil {
+		if errors.Is(err, store.ErrObservationNotFound) {
+			jsonError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"id":     id,
+		"pinned": pinned,
+	})
+}
+
+func (s *Server) handleSuggestTopicKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Type    string `json:"type"`
+		Title   string `json:"title"`
+		Content string `json:"content"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 50<<20)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&body); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			jsonError(w, http.StatusBadRequest, "request body too large")
+			return
+		}
+		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			jsonError(w, http.StatusBadRequest, "request body too large")
+			return
+		}
+		jsonError(w, http.StatusBadRequest, "invalid json: trailing data")
+		return
+	}
+	if strings.TrimSpace(body.Title) == "" && strings.TrimSpace(body.Content) == "" {
+		jsonError(w, http.StatusBadRequest, "provide title or content to suggest a topic_key")
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]string{
+		"topic_key": store.SuggestTopicKey(body.Type, body.Title, body.Content),
+	})
 }
 
 func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request) {
@@ -482,8 +1091,12 @@ func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request)
 	}
 
 	hard := queryBool(r, "hard", false)
-	if err := s.store.DeleteObservation(id, hard); err != nil {
+	if err := s.store.DeleteObservationForProject(id, r.URL.Query().Get("expected_project"), hard); err != nil {
 		switch {
+		case errors.Is(err, store.ErrExpectedProjectRequired):
+			jsonError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, store.ErrObservationProjectMismatch):
+			jsonError(w, http.StatusConflict, err.Error())
 		case errors.Is(err, store.ErrObservationNotFound):
 			jsonError(w, http.StatusNotFound, err.Error())
 		default:
@@ -515,6 +1128,20 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 
 	before := queryInt(r, "before", 5)
 	after := queryInt(r, "after", 5)
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
+	focus, err := s.store.GetObservation(id)
+	if err != nil {
+		jsonError(w, http.StatusNotFound, "observation not found")
+		return
+	}
+	if resolved.Project != "" && (focus.Project == nil || !strings.EqualFold(strings.TrimSpace(*focus.Project), resolved.Project)) {
+		jsonError(w, http.StatusNotFound, "observation not found in resolved project")
+		return
+	}
 
 	result, err := s.store.Timeline(id, before, after)
 	if err != nil {
@@ -526,10 +1153,14 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReviewList(w http.ResponseWriter, r *http.Request) {
-	project := r.URL.Query().Get("project")
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
 	limit := queryInt(r, "limit", 10)
 
-	observations, err := s.store.ObservationsNeedingReview(project, limit)
+	observations, err := s.store.ObservationsNeedingReview(resolved.Project, limit)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -564,9 +1195,23 @@ func (s *Server) handleReviewMarkReviewed(w http.ResponseWriter, r *http.Request
 		jsonError(w, http.StatusBadRequest, "observation_id is required")
 		return
 	}
-
-	if err := s.store.MarkReviewed(id); err != nil {
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
+	markReviewed := s.store.MarkReviewed
+	if resolved.Project != "" {
+		markReviewed = func(observationID int64) error {
+			return s.store.MarkReviewedForProject(observationID, resolved.Project)
+		}
+	}
+	if err := markReviewed(id); err != nil {
 		if errors.Is(err, store.ErrObservationNotFound) {
+			if resolved.Project != "" {
+				jsonError(w, http.StatusNotFound, "observation not found in resolved project")
+				return
+			}
 			jsonError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -607,6 +1252,10 @@ func (s *Server) handleAddPrompt(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
+	if err := body.ProjectProvenance.Validate(); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if body.SessionID == "" || body.Content == "" {
 		jsonError(w, http.StatusBadRequest, "session_id and content are required")
 		return
@@ -624,24 +1273,41 @@ func (s *Server) handleAddPrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	id, err := s.store.AddPrompt(body)
+	id, inserted, err := s.store.AddPromptWithResult(body)
 	if err != nil {
-		jsonError(w, http.StatusInternalServerError, err.Error())
+		switch {
+		case errors.Is(err, store.ErrPromptContentRequired):
+			jsonError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, store.ErrPromptInboxDeleted):
+			jsonError(w, http.StatusConflict, err.Error())
+		case writeOwnershipError(w, body.SessionID, err):
+		default:
+			jsonError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 
-	s.notifyWrite()
+	if inserted {
+		s.notifyWrite()
+	}
 	jsonResponse(w, http.StatusCreated, map[string]any{"id": id, "status": "saved"})
 }
 
 func (s *Server) handleRecentPrompts(w http.ResponseWriter, r *http.Request) {
-	project := r.URL.Query().Get("project")
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
 	limit := queryInt(r, "limit", 20)
 
-	prompts, err := s.store.RecentPrompts(project, limit)
+	prompts, err := s.store.RecentPrompts(resolved.Project, limit)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if prompts == nil {
+		prompts = []store.Prompt{}
 	}
 
 	jsonResponse(w, http.StatusOK, prompts)
@@ -653,15 +1319,23 @@ func (s *Server) handleSearchPrompts(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "q parameter is required")
 		return
 	}
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
 
 	prompts, err := s.store.SearchPrompts(
 		query,
-		r.URL.Query().Get("project"),
+		resolved.Project,
 		queryInt(r, "limit", 10),
 	)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if prompts == nil {
+		prompts = []store.Prompt{}
 	}
 
 	jsonResponse(w, http.StatusOK, prompts)
@@ -716,19 +1390,15 @@ func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
 // ─── Export / Import ─────────────────────────────────────────────────────────
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	project := query.Get("project")
-	if _, provided := query["project"]; provided && strings.TrimSpace(project) == "" {
-		jsonError(w, http.StatusBadRequest, "project parameter must not be blank")
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
 		return
 	}
 
-	var (
-		data *store.ExportData
-		err  error
-	)
-	if strings.TrimSpace(project) != "" {
-		data, err = s.store.ExportProject(project)
+	var data *store.ExportData
+	if resolved.Project != "" {
+		data, err = s.store.ExportProject(resolved.Project)
 	} else {
 		data, err = s.store.Export()
 	}
@@ -770,11 +1440,93 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 
 // ─── Context ─────────────────────────────────────────────────────────────────
 
+// contextMaxSectionLimit is the ceiling for a positive per-section cap on
+// GET /context, matching conflictsMaxLimit.
+const contextMaxSectionLimit = 500
+
+// contextMaxBytes is the largest total context budget accepted by GET /context.
+const contextMaxBytes = 64 * 1024
+
+// clampContextLimit caps a positive per-section limit at
+// contextMaxSectionLimit, so `observations=2147483647` cannot reach SQL as a
+// LIMIT wide enough to render a whole project into one response. Unlike
+// clampConflictsLimit it returns 0 and negatives untouched: those are the
+// legacy-default and omit-the-section states of the ContextOptions
+// convention, not out-of-range input.
+func clampContextLimit(v int) int {
+	if v > contextMaxSectionLimit {
+		return contextMaxSectionLimit
+	}
+	return v
+}
+
+func clampContextBytes(v int) int {
+	if v <= 0 {
+		return 0
+	}
+	if v > contextMaxBytes {
+		return contextMaxBytes
+	}
+	return v
+}
+
+// contextBytesQuery caps positive decimal budgets before converting to int,
+// including values beyond the native integer range.
+func contextBytesQuery(r *http.Request) int {
+	v := r.URL.Query().Get("max_bytes")
+	if v == "" {
+		return 0
+	}
+	if v[0] == '+' {
+		v = v[1:]
+	}
+	if v == "" {
+		return 0
+	}
+	budget := 0
+	for _, digit := range v {
+		if digit < '0' || digit > '9' {
+			return 0
+		}
+		if budget <= contextMaxBytes {
+			budget = budget*10 + int(digit-'0')
+		}
+	}
+	return clampContextBytes(budget)
+}
+
+var contextHistoryFormatter = func(s *store.Store, project, scope string, opts store.ContextOptions) (string, error) {
+	return s.FormatContextWithOptions(project, scope, opts)
+}
+
 func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
-	project := r.URL.Query().Get("project")
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
 	scope := r.URL.Query().Get("scope")
 
-	context, err := s.store.FormatContext(project, scope)
+	// Per-section caps via store.ContextOptions: 0 (param absent/empty/
+	// unparseable) keeps FormatContext's legacy default, >0 caps the
+	// section, and <0 is a DELIBERATE way to omit the section (and its
+	// "### ..." header) entirely — not a bug to be filtered out like the
+	// `err == nil && n > 0` guard in the upstream reference this was
+	// adapted from (PR #162). queryInt/queryBool already fall back to the
+	// zero value on any bad input, so garbage query params never 4xx here.
+	// clampContextLimit only puts a ceiling on the >0 state; 0 and negatives
+	// pass through untouched so all three states survive.
+	opts := store.ContextOptions{
+		MaxBytes:     contextBytesQuery(r),
+		Observations: clampContextLimit(queryInt(r, "observations", 0)),
+		Prompts:      clampContextLimit(queryInt(r, "prompts", 0)),
+		Sessions:     clampContextLimit(queryInt(r, "sessions", 0)),
+		Pinned:       clampContextLimit(queryInt(r, "pinned", 0)),
+		Compact:      queryBool(r, "compact", false),
+		OlderHistory: queryBool(r, "older_history", false),
+	}
+
+	context, err := contextHistoryFormatter(s.store, resolved.Project, scope, opts)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -783,10 +1535,76 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]string{"context": context})
 }
 
-func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := loadServerStats(s.store)
+func (s *Server) handleCompactionContext(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
+	if sessionID == "" {
+		jsonError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+
+	context, err := s.store.FormatCompactionContext(sessionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			jsonError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]string{"context": context})
+}
+
+// handleListProjects serves the HTTP view of mem_list_projects (engram#675),
+// backed by the same store query as the MCP tool and `engram projects list` so
+// CLI, MCP, and HTTP never diverge. An empty store is a successful empty listing.
+func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	projects, err := s.store.ListProjectsWithStats()
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if projects == nil {
+		projects = []store.ProjectStats{}
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"projects": projects,
+		"count":    len(projects),
+	})
+}
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		var unknown *projectpkg.UnknownProjectError
+		if errors.As(err, &unknown) {
+			// The available-project lookup can fail independently of resolution.
+			available, listErr := s.store.ListProjectNames()
+			if listErr != nil {
+				jsonErrorWithFields(w, http.StatusInternalServerError, "project resolution failed", map[string]any{"code": "project_resolution_failed"})
+				return
+			}
+			jsonErrorWithFields(w, http.StatusNotFound, fmt.Sprintf("project %q not found", unknown.Name), map[string]any{
+				"code": "unknown_project", "available_projects": available,
+			})
+			return
+		}
+		var transition *projectpkg.ProjectTransitionError
+		if !errors.Is(err, projectpkg.ErrInvalidProjectName) && !errors.Is(err, projectpkg.ErrAmbiguousProject) && !errors.As(err, &transition) {
+			jsonErrorWithFields(w, http.StatusInternalServerError, "project resolution failed", map[string]any{"code": "project_resolution_failed"})
+			return
+		}
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
+	var stats *store.Stats
+	if resolved.Project != "" {
+		stats, err = s.store.StatsProject(resolved.Project)
+	} else {
+		stats, err = loadServerStats(s.store)
+	}
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "stats unavailable")
 		return
 	}
 
@@ -794,58 +1612,17 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
-	projectName := strings.TrimSpace(r.URL.Query().Get("project"))
-	if projectName != "" {
-		projectName, _ = store.NormalizeProject(projectName)
-		exists, err := s.store.ProjectExists(projectName)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if !exists {
-			available, err := s.store.ListProjectNames()
-			if err != nil {
-				jsonError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			jsonErrorWithFields(w, http.StatusNotFound, fmt.Sprintf("project %q not found", projectName), map[string]any{
-				"code":               "unknown_project",
-				"available_projects": available,
-			})
-			return
-		}
-	} else {
-		cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
-		if cwd == "" {
-			var err error
-			cwd, err = os.Getwd()
-			if err != nil {
-				jsonError(w, http.StatusInternalServerError, "failed to detect cwd: "+err.Error())
-				return
-			}
-		}
-		res := projectpkg.DetectProjectFull(cwd)
-		if res.Error != nil {
-			code := "project_detection_failed"
-			if len(res.AvailableProjects) > 0 {
-				code = "ambiguous_project"
-			}
-			jsonErrorWithFields(w, http.StatusBadRequest, "project detection failed: "+res.Error.Error(), map[string]any{
-				"code":               code,
-				"available_projects": res.AvailableProjects,
-			})
-			return
-		}
-		projectName, _ = store.NormalizeProject(res.Project)
+	resolved, err := s.resolveRequestProjectWithDetector(r, projectpkg.ResolutionCurrent, true, s.store.InspectProject)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
 	}
+	projectName := resolved.Project
 
 	check := strings.TrimSpace(r.URL.Query().Get("check"))
 	runner := diagnostic.NewRunner()
 	scope := diagnostic.Scope{Store: s.store, Project: projectName, Now: time.Now()}
-	var (
-		report diagnostic.Report
-		err    error
-	)
+	var report diagnostic.Report
 	if check != "" {
 		report, err = runner.RunOne(r.Context(), scope, check)
 	} else {
@@ -860,18 +1637,31 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 
 // ─── Project Detection ───────────────────────────────────────────────────────
 
+// handleCurrentProject returns canonical current-project detection metadata.
 func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 	cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
 	if cwd == "" {
-		var err error
-		cwd, err = os.Getwd()
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "failed to detect cwd: "+err.Error())
+		var cwdErr error
+		cwd, cwdErr = os.Getwd()
+		if cwdErr != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to detect cwd: "+cwdErr.Error())
 			return
 		}
 	}
+	res, err := projectpkg.Resolve(projectpkg.ResolutionOptions{
+		Mode:      projectpkg.ResolutionCurrent,
+		Directory: cwd,
+		Detect:    s.store.DetectProject,
+	})
+	if err != nil && !errors.Is(err, projectpkg.ErrAmbiguousProject) {
+		s.writeProjectResolutionError(w, res, err)
+		return
+	}
+	jsonResponse(w, http.StatusOK, currentProjectPayload(cwd, res))
+}
 
-	res := projectpkg.DetectProjectFull(cwd)
+// currentProjectPayload builds the shared current-project response metadata.
+func currentProjectPayload(cwd string, res projectpkg.DetectionResult) map[string]any {
 	payload := map[string]any{
 		"project":            res.Project,
 		"project_source":     res.Source,
@@ -886,12 +1676,108 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 		payload["error_hint"] = res.Error.Error()
 	}
 
-	jsonResponse(w, http.StatusOK, payload)
+	return payload
+}
+
+// resolveRequestProject applies the shared resolution modes to HTTP operations.
+// Current-project reads require known explicit/process overrides, while cwd
+// detection remains usable before a project has any stored memories.
+func (s *Server) resolveRequestProject(r *http.Request, mode projectpkg.ResolutionMode, requireKnownOverrides bool) (projectpkg.DetectionResult, error) {
+	return s.resolveRequestProjectWithDetector(r, mode, requireKnownOverrides, s.store.DetectProject)
+}
+
+func (s *Server) resolveRequestProjectWithDetector(r *http.Request, mode projectpkg.ResolutionMode, requireKnownOverrides bool, detect func(string) projectpkg.DetectionResult) (projectpkg.DetectionResult, error) {
+	query := r.URL.Query()
+	projectValues, projectProvided := query["project"]
+	if projectProvided {
+		if len(projectValues) != 1 || strings.TrimSpace(projectValues[0]) == "" {
+			return projectpkg.DetectionResult{}, fmt.Errorf("%w: project parameter must be specified exactly once and must not be blank", projectpkg.ErrInvalidProjectName)
+		}
+	}
+	if raw, allProvided := query["all_projects"]; allProvided {
+		if len(raw) != 1 {
+			return projectpkg.DetectionResult{}, fmt.Errorf("%w: all_projects must be a boolean", projectpkg.ErrInvalidProjectName)
+		}
+		all, err := strconv.ParseBool(raw[0])
+		if err != nil {
+			return projectpkg.DetectionResult{}, fmt.Errorf("%w: all_projects must be a boolean", projectpkg.ErrInvalidProjectName)
+		}
+		if all {
+			if projectProvided {
+				return projectpkg.DetectionResult{}, fmt.Errorf("%w: project and all_projects cannot be used together", projectpkg.ErrInvalidProjectName)
+			}
+			mode = projectpkg.ResolutionAll
+		}
+	}
+	return projectpkg.Resolve(projectpkg.ResolutionOptions{
+		Mode:                 mode,
+		Explicit:             query.Get("project"),
+		Directory:            query.Get("cwd"),
+		ProjectExists:        s.store.ProjectExists,
+		Detect:               detect,
+		RequireKnownExplicit: requireKnownOverrides,
+		RequireKnownProcess:  requireKnownOverrides,
+	})
+}
+
+func (s *Server) writeProjectResolutionError(w http.ResponseWriter, res projectpkg.DetectionResult, err error) {
+	var unknown *projectpkg.UnknownProjectError
+	if errors.As(err, &unknown) {
+		available, listErr := s.store.ListProjectNames()
+		if listErr != nil {
+			jsonErrorWithFields(w, http.StatusInternalServerError, "project resolution failed: "+listErr.Error(), map[string]any{
+				"code": "project_resolution_failed",
+			})
+			return
+		}
+		jsonErrorWithFields(w, http.StatusNotFound, fmt.Sprintf("project %q not found", unknown.Name), map[string]any{
+			"code":               "unknown_project",
+			"available_projects": available,
+		})
+		return
+	}
+	code := "project_resolution_failed"
+	status := http.StatusInternalServerError
+	if errors.Is(err, projectpkg.ErrInvalidProjectName) {
+		code = "invalid_project"
+		status = http.StatusBadRequest
+	}
+	if errors.Is(err, projectpkg.ErrAmbiguousProject) {
+		code = "ambiguous_project"
+		status = http.StatusConflict
+	}
+	var transition *projectpkg.ProjectTransitionError
+	if errors.As(err, &transition) {
+		code = "project_transition_conflict"
+		status = http.StatusConflict
+	}
+	fields := map[string]any{"code": code}
+	if transition != nil {
+		fields["candidate_project"] = transition.Candidate
+		fields["available_projects"] = res.AvailableProjects
+	}
+	if errors.Is(err, projectpkg.ErrAmbiguousProject) {
+		fields["available_projects"] = res.AvailableProjects
+		fields["project_source"] = res.Source
+		fields["project_path"] = res.Path
+	}
+	jsonErrorWithFields(w, status, "project resolution failed: "+err.Error(), fields)
 }
 
 // ─── Sync Status ─────────────────────────────────────────────────────────────
 
 func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
+	if resolved.Source == projectpkg.SourceAllProjects {
+		jsonErrorWithFields(w, http.StatusBadRequest, "all_projects is not supported for sync status", map[string]any{
+			"code": "unsupported_project_scope",
+		})
+		return
+	}
 	if s.syncStatus == nil {
 		jsonResponse(w, http.StatusOK, map[string]any{
 			"enabled": false,
@@ -900,7 +1786,7 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status := s.syncStatus.Status(r.URL.Query().Get("project"))
+	status := s.syncStatus.Status(resolved.Project)
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"enabled":              status.Enabled,
 		"phase":                status.Phase,
@@ -920,56 +1806,71 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ─── Project Migration ───────────────────────────────────────────────────────
+// ─── Project Ownership Rescue ─────────────────────────────────────────────────
 
-func (s *Server) handleMigrateProject(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<10) // 1 KB max
+func (s *Server) handleRescueProjectOwnership(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10) // 8 KB max
 	var body struct {
-		OldProject string `json:"old_project"`
-		NewProject string `json:"new_project"`
+		TargetProject  string   `json:"target_project"`
+		Confirmed      bool     `json:"confirmed"`
+		ObservationIDs []int64  `json:"observation_ids"`
+		SessionIDs     []string `json:"session_ids"`
+		PromptIDs      []int64  `json:"prompt_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if body.OldProject == "" || body.NewProject == "" {
-		jsonError(w, http.StatusBadRequest, "old_project and new_project are required")
+	target, _ := store.NormalizeProject(body.TargetProject)
+	if target == "" {
+		jsonError(w, http.StatusBadRequest, "target_project is required")
 		return
 	}
-	// Normalize both names using the same rules the store applies so that
-	// case-only differences (e.g. "repo_name" vs "Repo_Name") are treated as
-	// identical and do not trigger a migration that would create duplicates.
-	// See: https://github.com/Gentleman-Programming/engram/issues/438
-	normalizedOld, _ := store.NormalizeProject(body.OldProject)
-	normalizedNew, _ := store.NormalizeProject(body.NewProject)
-	if normalizedOld == normalizedNew {
-		jsonResponse(w, http.StatusOK, map[string]any{"status": "skipped", "reason": "names are identical"})
+	if !body.Confirmed {
+		jsonError(w, http.StatusBadRequest, "confirmed must be true")
 		return
 	}
-
-	result, err := s.store.MigrateProject(body.OldProject, body.NewProject)
+	result, err := s.store.RescueNullProjectOwnership(store.ProjectRescueParams{
+		TargetProject:  target,
+		ObservationIDs: body.ObservationIDs,
+		SessionIDs:     body.SessionIDs,
+		PromptIDs:      body.PromptIDs,
+	})
 	if err != nil {
-		log.Printf("[engram] project migration failed: %v", err)
-		jsonError(w, http.StatusInternalServerError, "migration failed")
+		if errors.Is(err, store.ErrProjectRequired) || errors.Is(err, store.ErrProjectRescueInvalidRequest) {
+			jsonError(w, http.StatusBadRequest, "invalid ownership rescue request: provide a target project and at least one positive record ID or non-blank session ID")
+			return
+		}
+		log.Printf("[engram] project ownership rescue failed: %v", err)
+		jsonError(w, http.StatusInternalServerError, "project ownership rescue is temporarily unavailable")
 		return
 	}
-
-	if !result.Migrated {
-		jsonResponse(w, http.StatusOK, map[string]any{"status": "skipped", "reason": "no records found"})
-		return
+	if result.Rescued() > 0 || result.Journaled {
+		s.notifyWrite()
 	}
-
-	log.Printf("[engram] migrated project %q → %q (obs: %d, sessions: %d, prompts: %d)",
-		body.OldProject, body.NewProject,
-		result.ObservationsUpdated, result.SessionsUpdated, result.PromptsUpdated)
-
+	// "rescued" and "partially_rescued" are distinguishable outcomes: the
+	// counters alone cannot tell a clean move apart from one that left records
+	// behind, so the status and the blocked list say it outright.
+	status := "rescued"
+	if !result.Complete {
+		status = "partially_rescued"
+	}
+	blocked := result.Blocked
+	if blocked == nil {
+		blocked = []store.ProjectRescueBlocked{}
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"status":       "migrated",
-		"old_project":  body.OldProject,
-		"new_project":  body.NewProject,
-		"observations": result.ObservationsUpdated,
-		"sessions":     result.SessionsUpdated,
-		"prompts":      result.PromptsUpdated,
+		"status":                status,
+		"complete":              result.Complete,
+		"blocked":               blocked,
+		"target_project":        target,
+		"rescued_observations":  result.RescuedObservations,
+		"rescued_sessions":      result.RescuedSessions,
+		"rescued_prompts":       result.RescuedPrompts,
+		"conflicting_records":   result.ConflictingRecords,
+		"skipped_records":       result.SkippedRecords,
+		"journaled_local":       result.Journaled,
+		"reconciliation_status": "local journal pending autosync",
 	})
 }
 
@@ -995,16 +1896,22 @@ func clampConflictsLimit(v, defaultVal int) int {
 // handleListConflicts serves GET /conflicts
 // Query params: project, status, since (RFC3339), limit (default 50, max 500), offset.
 func (s *Server) handleListConflicts(w http.ResponseWriter, r *http.Request) {
-	project := r.URL.Query().Get("project")
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
+	project := resolved.Project
 	status := r.URL.Query().Get("status")
 	limit := clampConflictsLimit(queryInt(r, "limit", conflictsDefaultLimit), conflictsDefaultLimit)
 	offset := queryInt(r, "offset", 0)
 
 	opts := store.ListRelationsOptions{
-		Project: project,
-		Status:  status,
-		Limit:   limit,
-		Offset:  offset,
+		Project:            project,
+		Status:             status,
+		Limit:              limit,
+		Offset:             offset,
+		ExcludeNotConflict: true,
 	}
 
 	sinceStr := r.URL.Query().Get("since")
@@ -1025,9 +1932,10 @@ func (s *Server) handleListConflicts(w http.ResponseWriter, r *http.Request) {
 
 	// Count without limit/offset for the total field.
 	countOpts := store.ListRelationsOptions{
-		Project:   project,
-		Status:    status,
-		SinceTime: opts.SinceTime,
+		Project:            project,
+		Status:             status,
+		SinceTime:          opts.SinceTime,
+		ExcludeNotConflict: true,
 	}
 	total, err := s.store.CountRelations(countOpts)
 	if err != nil {
@@ -1046,7 +1954,12 @@ func (s *Server) handleListConflicts(w http.ResponseWriter, r *http.Request) {
 // handleConflictsStats serves GET /conflicts/stats
 // Query params: project (optional — empty means global).
 func (s *Server) handleConflictsStats(w http.ResponseWriter, r *http.Request) {
-	project := r.URL.Query().Get("project")
+	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
+	project := resolved.Project
 
 	stats, err := s.store.GetRelationStats(project)
 	if err != nil {
@@ -1099,15 +2012,18 @@ func (s *Server) handleListDeferred(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleScanConflicts serves POST /conflicts/scan
-// Body: {"project":"X","since":"...","apply":bool,"max_insert":int,
+// Body: {"project":"X","since":"...","limit":int,"cursor":int,"apply":bool,"max_insert":int,
 //
 //	"semantic":bool,"concurrency":int,"timeout_per_call_seconds":int,"max_semantic":int}
 func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Project   string `json:"project"`
-		Since     string `json:"since"`
-		Apply     bool   `json:"apply"`
-		MaxInsert int    `json:"max_insert"`
+		Project     string `json:"project"`
+		AllProjects bool   `json:"all_projects"`
+		Since       string `json:"since"`
+		Apply       bool   `json:"apply"`
+		MaxInsert   int    `json:"max_insert"`
+		Limit       *int   `json:"limit"`
+		Cursor      *int64 `json:"cursor"`
 
 		// Phase 4 semantic fields — all optional, defaults match CLI.
 		// Pointer types so absent fields are nil (use default) vs. explicit 0 (invalid).
@@ -1120,11 +2036,35 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	if body.Project == "" {
-		jsonError(w, http.StatusBadRequest, "project is required")
+	if body.AllProjects && strings.TrimSpace(body.Project) != "" {
+		jsonError(w, http.StatusBadRequest, "project and all_projects cannot be used together")
 		return
 	}
-
+	mode := projectpkg.ResolutionCurrent
+	if body.AllProjects {
+		mode = projectpkg.ResolutionAll
+	}
+	resolved, err := projectpkg.Resolve(projectpkg.ResolutionOptions{
+		Mode:                 mode,
+		Explicit:             body.Project,
+		Directory:            r.URL.Query().Get("cwd"),
+		ProjectExists:        s.store.ProjectExists,
+		Detect:               s.store.DetectProject,
+		RequireKnownExplicit: true,
+		RequireKnownProcess:  true,
+	})
+	if err != nil {
+		s.writeProjectResolutionError(w, resolved, err)
+		return
+	}
+	if body.Limit != nil && (*body.Limit < 1 || *body.Limit > store.DefaultScanLimit) {
+		jsonError(w, http.StatusBadRequest, fmt.Sprintf("limit must be between 1 and %d", store.DefaultScanLimit))
+		return
+	}
+	if body.Cursor != nil && *body.Cursor < 0 {
+		jsonError(w, http.StatusBadRequest, "cursor must be non-negative")
+		return
+	}
 	// Resolve semantic params: validate explicit values, apply defaults for absent fields.
 	concurrency := 5
 	timeoutPerCallSeconds := 60
@@ -1156,10 +2096,12 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	opts := store.ScanOptions{
-		Project:   body.Project,
-		Apply:     body.Apply,
-		MaxInsert: body.MaxInsert,
+	opts := store.ScanOptions{Project: resolved.Project, Apply: body.Apply, MaxInsert: body.MaxInsert}
+	if body.Limit != nil {
+		opts.Limit = *body.Limit
+	}
+	if body.Cursor != nil {
+		opts.Cursor = *body.Cursor
 	}
 	if body.Since != "" {
 		t, err := time.Parse(time.RFC3339, body.Since)
@@ -1200,7 +2142,12 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		opts.BuildPrompt = promptBuilder
 	}
 
-	result, err := s.store.ScanProject(opts)
+	var result store.ScanResult
+	if body.AllProjects {
+		result, err = s.store.ScanAllProjects(opts)
+	} else {
+		result, err = s.store.ScanProject(opts)
+	}
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1209,6 +2156,7 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"project":          result.Project,
 		"inspected":        result.Inspected,
+		"ranked_queries":   result.RankedQueries,
 		"candidates_found": result.CandidatesFound,
 		"already_related":  result.AlreadyRelated,
 		"inserted":         result.RelationsInserted,
@@ -1219,8 +2167,11 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		"semantic_skipped": result.SemanticSkipped,
 		"semantic_errors":  result.SemanticErrors,
 	}
+	if result.NextCursor != nil {
+		resp["next_cursor"] = *result.NextCursor
+	}
 	if result.Capped {
-		resp["warning"] = "cap reached: not all candidates were inserted"
+		resp["warning"] = "cap reached: this page has no continuation; rerun from the same cursor with a higher applicable cap"
 	}
 
 	jsonResponse(w, http.StatusOK, resp)

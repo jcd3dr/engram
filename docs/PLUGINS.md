@@ -351,3 +351,9 @@ Set up API with <private>sk-abc123</private> key
 
 1. **Plugin layer** — stripped before data leaves the process
 2. **Store layer** — `stripPrivateTags()` in Go before any DB write
+
+## Delivery
+
+Memory operations are internal bookkeeping, never the user-facing answer.
+Complete required memory work before composing the completed-task reply; then send the complete answer as the final message of the turn with no later tool calls.
+If memory work fails or needs follow-up, still send the answer.

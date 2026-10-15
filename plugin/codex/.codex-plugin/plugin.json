@@ -11,7 +11,11 @@
   "repository": "https://github.com/jcd3dr/engram",
   "license": "MIT",
   "category": "Productivity",
-  "keywords": ["memory", "persistence", "sessions", "context"],
-  "hooks": "./hooks/hooks.json",
-  "mcpServers": "./.mcp.json"
+  "keywords": [
+    "memory",
+    "persistence",
+    "sessions",
+    "context"
+  ],
+  "hooks": "./hooks/hooks.json"
 }
