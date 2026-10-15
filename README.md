@@ -62,7 +62,7 @@ Windows, Linux, and other install methods → [docs/INSTALLATION.md](docs/INSTAL
 
 | Agent                       | One-liner                                                                                    |
 | --------------------------- | -------------------------------------------------------------------------------------------- |
-| Claude Code                 | `claude plugin marketplace add Gentleman-Programming/engram && claude plugin install engram` |
+| Claude Code                 | `claude plugin marketplace add jcd3dr/engram && claude plugin install engram` |
 | Pi                          | `engram setup pi`                                                                            |
 | OpenCode                    | `engram setup opencode`                                                                      |
 | Gemini CLI                  | `engram setup gemini-cli`                                                                    |
@@ -259,7 +259,7 @@ Try the new memory-conflict-surfacing features in **complete isolation** from yo
 ### Setup (4 commands)
 
 ```bash
-git clone https://github.com/Gentleman-Programming/engram.git engram-beta-repo
+git clone https://github.com/jcd3dr/engram.git engram-beta-repo
 cd engram-beta-repo && git checkout feat/memory-conflict-surfacing-cloud-sync
 docker compose -f docker-compose.beta.yml up -d
 go build -o ./engram-beta ./cmd/engram
