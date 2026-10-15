@@ -277,7 +277,7 @@ func TestUpdateInstructions(t *testing.T) {
 	if runtime.GOOS != "darwin" && !strings.Contains(msg, "github.com/Gentleman-Programming/engram/v3/cmd/engram@latest") {
 		t.Fatalf("update instructions = %q, want v3 Go install command", msg)
 	}
-	if runtime.GOOS != "linux" && !strings.Contains(msg, "https://github.com/Gentleman-Programming/engram/releases/latest") {
+	if runtime.GOOS != "linux" && !strings.Contains(msg, "https://github.com/jcd3dr/engram/releases/latest") {
 		t.Fatalf("update instructions = %q, want canonical GitHub Releases URL", msg)
 	}
 }

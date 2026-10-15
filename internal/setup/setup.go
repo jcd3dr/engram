@@ -22,7 +22,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Gentleman-Programming/engram/internal/mcp"
+	"github.com/Gentleman-Programming/engram/v3/internal/mcp"
 )
 
 var (
