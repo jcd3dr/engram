@@ -1,6 +1,6 @@
 package dashboard
 
-//go:generate go tool templ generate
+//go:generate go -C ../../.. tool templ generate -path ./internal/cloud/dashboard
 
 import (
 	"context"
@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
-	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/constants"
 	"github.com/a-h/templ"
 )
 
@@ -39,16 +39,21 @@ type staticSyncStatusProvider struct {
 func (s staticSyncStatusProvider) Status() SyncStatus { return s.status }
 
 type MountConfig struct {
-	RequireSession      func(r *http.Request) error
-	ValidateLoginToken  func(token string) error
-	CreateSessionCookie func(w http.ResponseWriter, r *http.Request, token string) error
-	ClearSessionCookie  func(w http.ResponseWriter, r *http.Request)
-	IsAdmin             func(r *http.Request) bool
-	GetDisplayName      func(r *http.Request) string
-	Store               DashboardStore
-	ManagedUsers        ManagedUsersStore
-	MaxLoginBodyBytes   int64
-	StatusProvider      SyncStatusProvider
+	RequireSession        func(r *http.Request) error
+	ValidateLoginToken    func(token string) error
+	CreateSessionCookie   func(w http.ResponseWriter, r *http.Request, token string) error
+	ClearSessionCookie    func(w http.ResponseWriter, r *http.Request)
+	IsAdmin               func(r *http.Request) bool
+	CanManageManagedUsers func(r *http.Request) bool
+	GetDisplayName        func(r *http.Request) string
+	Store                 DashboardStore
+	// StoreForRequest returns an immutable, request-owned view over Store for
+	// authenticated managed principals. Resolution failures fail the request
+	// closed before a handler can observe the shared store.
+	StoreForRequest   func(r *http.Request) (DashboardStore, error)
+	ManagedUsers      ManagedUsersStore
+	MaxLoginBodyBytes int64
+	StatusProvider    SyncStatusProvider
 }
 
 type DashboardStore interface {
@@ -106,6 +111,26 @@ type handlers struct {
 	cfg MountConfig
 }
 
+type dashboardHandler func(*handlers, http.ResponseWriter, *http.Request)
+
+// requireScopedSession authenticates before deriving a request-local store.
+// The copied handlers value prevents principal-scoped data from entering the
+// process-wide MountConfig or CloudStore cache.
+func (h *handlers) requireScopedSession(next dashboardHandler) http.HandlerFunc {
+	return h.requireSession(func(w http.ResponseWriter, r *http.Request) {
+		scoped := *h
+		if h.cfg.StoreForRequest != nil {
+			store, err := h.cfg.StoreForRequest(r)
+			if err != nil {
+				h.renderStoreError(w, r, "dashboard", "Dashboard data", err)
+				return
+			}
+			scoped.cfg.Store = store
+		}
+		next(&scoped, w, r)
+	})
+}
+
 func Mount(mux *http.ServeMux, cfg MountConfig) {
 	h := &handlers{cfg: cfg}
 
@@ -120,42 +145,44 @@ func Mount(mux *http.ServeMux, cfg MountConfig) {
 	mux.HandleFunc("POST /dashboard/login", h.handleLoginSubmit)
 	mux.HandleFunc("POST /dashboard/logout", h.handleLogout)
 
-	mux.HandleFunc("GET /dashboard", h.requireSession(h.handleDashboardHome))
-	mux.HandleFunc("GET /dashboard/", h.requireSession(h.handleDashboardHome))
-	mux.HandleFunc("GET /dashboard/stats", h.requireSession(h.handleDashboardStats))
-	mux.HandleFunc("GET /dashboard/activity", h.requireSession(h.handleDashboardActivity))
-	mux.HandleFunc("GET /dashboard/browser", h.requireSession(h.handleBrowser))
-	mux.HandleFunc("GET /dashboard/browser/observations", h.requireSession(h.handleBrowserObservations))
-	mux.HandleFunc("GET /dashboard/browser/sessions", h.requireSession(h.handleBrowserSessions))
-	mux.HandleFunc("GET /dashboard/browser/sessions/{sessionID}", h.requireSession(h.handleBrowserSessionDetail))
-	mux.HandleFunc("GET /dashboard/browser/prompts", h.requireSession(h.handleBrowserPrompts))
-	mux.HandleFunc("GET /dashboard/projects", h.requireSession(h.handleProjects))
-	mux.HandleFunc("GET /dashboard/projects/{project}", h.requireSession(h.handleProjectDetail))
-	mux.HandleFunc("GET /dashboard/contributors", h.requireSession(h.handleContributors))
-	mux.HandleFunc("GET /dashboard/contributors/list", h.requireSession(h.handleContributorsList))
-	mux.HandleFunc("GET /dashboard/contributors/{contributor}", h.requireSession(h.handleContributorDetail))
-	mux.HandleFunc("GET /dashboard/admin", h.requireSession(h.handleAdmin))
-	mux.HandleFunc("GET /dashboard/admin/projects", h.requireSession(h.handleAdminProjectControls))
+	mux.HandleFunc("GET /dashboard", h.requireScopedSession((*handlers).handleDashboardHome))
+	mux.HandleFunc("GET /dashboard/", h.requireScopedSession((*handlers).handleDashboardHome))
+	mux.HandleFunc("GET /dashboard/stats", h.requireScopedSession((*handlers).handleDashboardStats))
+	mux.HandleFunc("GET /dashboard/activity", h.requireScopedSession((*handlers).handleDashboardActivity))
+	mux.HandleFunc("GET /dashboard/browser", h.requireScopedSession((*handlers).handleBrowser))
+	mux.HandleFunc("GET /dashboard/browser/observations", h.requireScopedSession((*handlers).handleBrowserObservations))
+	mux.HandleFunc("GET /dashboard/browser/sessions", h.requireScopedSession((*handlers).handleBrowserSessions))
+	mux.HandleFunc("GET /dashboard/browser/sessions/{sessionID}", h.requireScopedSession((*handlers).handleBrowserSessionDetail))
+	mux.HandleFunc("GET /dashboard/browser/prompts", h.requireScopedSession((*handlers).handleBrowserPrompts))
+	mux.HandleFunc("GET /dashboard/projects", h.requireScopedSession((*handlers).handleProjects))
+	mux.HandleFunc("GET /dashboard/projects/{project}", h.requireScopedSession((*handlers).handleProjectDetail))
+	mux.HandleFunc("GET /dashboard/contributors", h.requireScopedSession((*handlers).handleContributors))
+	mux.HandleFunc("GET /dashboard/contributors/list", h.requireScopedSession((*handlers).handleContributorsList))
+	mux.HandleFunc("GET /dashboard/contributors/{contributor}", h.requireScopedSession((*handlers).handleContributorDetail))
+	mux.HandleFunc("GET /dashboard/admin", h.requireScopedSession((*handlers).handleAdmin))
+	mux.HandleFunc("GET /dashboard/admin/projects", h.requireScopedSession((*handlers).handleAdminProjectControls))
 	// R4-10: /dashboard/admin/contributors was a dead route (duplicate of /dashboard/contributors
 	// behind an extra admin gate). Removed to avoid confusion.
 
 	// 11 new routes — visual parity + composite-ID detail pages (REQ-106, Design Decision 3).
-	mux.HandleFunc("GET /dashboard/projects/list", h.requireSession(h.handleProjectsList))
-	mux.HandleFunc("GET /dashboard/projects/{name}/observations", h.requireSession(h.handleProjectObservationsPartial))
-	mux.HandleFunc("GET /dashboard/projects/{name}/sessions", h.requireSession(h.handleProjectSessionsPartial))
-	mux.HandleFunc("GET /dashboard/projects/{name}/prompts", h.requireSession(h.handleProjectPromptsPartial))
-	mux.HandleFunc("GET /dashboard/admin/users", h.requireSession(h.handleAdminUsers))
-	mux.HandleFunc("GET /dashboard/admin/users/list", h.requireSession(h.handleAdminUsersList))
-	mux.HandleFunc("GET /dashboard/admin/health", h.requireSession(h.handleAdminHealth))
+	mux.HandleFunc("GET /dashboard/projects/list", h.requireScopedSession((*handlers).handleProjectsList))
+	mux.HandleFunc("GET /dashboard/projects/{name}/observations", h.requireScopedSession((*handlers).handleProjectObservationsPartial))
+	mux.HandleFunc("GET /dashboard/projects/{name}/sessions", h.requireScopedSession((*handlers).handleProjectSessionsPartial))
+	mux.HandleFunc("GET /dashboard/projects/{name}/prompts", h.requireScopedSession((*handlers).handleProjectPromptsPartial))
+	mux.HandleFunc("GET /dashboard/admin/users", h.requireScopedSession((*handlers).handleAdminUsers))
+	mux.HandleFunc("GET /dashboard/admin/users/list", h.requireScopedSession((*handlers).handleAdminUsersList))
+	mux.HandleFunc("GET /dashboard/admin/health", h.requireScopedSession((*handlers).handleAdminHealth))
+	// Sync controls are mutations, not dashboard reads. Keep their established
+	// admin-only store semantics outside request read scoping.
 	mux.HandleFunc("POST /dashboard/admin/projects/{name}/sync", h.requireSession(h.handleAdminSyncTogglePost))
-	mux.HandleFunc("GET /dashboard/admin/projects/{name}/sync/form", h.requireSession(h.handleAdminSyncToggleForm))
-	mux.HandleFunc("GET /dashboard/sessions/{project}/{sessionID}", h.requireSession(h.handleSessionDetail))
-	mux.HandleFunc("GET /dashboard/observations/{project}/{sessionID}/{syncID}", h.requireSession(h.handleObservationDetail))
-	mux.HandleFunc("GET /dashboard/prompts/{project}/{sessionID}/{syncID}", h.requireSession(h.handlePromptDetail))
+	mux.HandleFunc("GET /dashboard/admin/projects/{name}/sync/form", h.requireScopedSession((*handlers).handleAdminSyncToggleForm))
+	mux.HandleFunc("GET /dashboard/sessions/{project}/{sessionID}", h.requireScopedSession((*handlers).handleSessionDetail))
+	mux.HandleFunc("GET /dashboard/observations/{project}/{sessionID}/{syncID}", h.requireScopedSession((*handlers).handleObservationDetail))
+	mux.HandleFunc("GET /dashboard/prompts/{project}/{sessionID}/{syncID}", h.requireScopedSession((*handlers).handlePromptDetail))
 
 	// Audit log routes — admin-gated (REQ-408, REQ-409).
-	mux.HandleFunc("GET /dashboard/admin/audit-log", h.requireSession(h.handleAdminAuditLog))
-	mux.HandleFunc("GET /dashboard/admin/audit-log/list", h.requireSession(h.handleAdminAuditLogList))
+	mux.HandleFunc("GET /dashboard/admin/audit-log", h.requireScopedSession((*handlers).handleAdminAuditLog))
+	mux.HandleFunc("GET /dashboard/admin/audit-log/list", h.requireScopedSession((*handlers).handleAdminAuditLogList))
 }
 
 func Handler() http.Handler {
@@ -355,7 +382,7 @@ func (h *handlers) handleDashboardActivity(w http.ResponseWriter, r *http.Reques
 	} else {
 		b.WriteString(`<table class="data-table"><thead><tr><th>Project</th><th>Type</th><th>Title</th><th>Session</th><th>Created</th></tr></thead><tbody>`)
 		for _, row := range rows {
-			b.WriteString(fmt.Sprintf(`<tr><td>%s</td><td>%s</td><td>%s</td><td><a href="%s">%s</a></td><td>%s</td></tr>`, html.EscapeString(row.Project), html.EscapeString(row.Type), html.EscapeString(row.Title), safeQuery("/dashboard/browser/sessions/"+url.PathEscape(row.SessionID), preserveQuery(r.URL.RawQuery, "project", row.Project)), html.EscapeString(row.SessionID), html.EscapeString(row.CreatedAt)))
+			fmt.Fprintf(&b, `<tr><td>%s</td><td>%s</td><td>%s</td><td><a href="%s">%s</a></td><td>%s</td></tr>`, html.EscapeString(row.Project), html.EscapeString(row.Type), html.EscapeString(row.Title), safeQuery("/dashboard/browser/sessions/"+url.PathEscape(row.SessionID), preserveQuery(r.URL.RawQuery, "project", row.Project)), html.EscapeString(row.SessionID), html.EscapeString(formatTimestamp(row.CreatedAt)))
 		}
 		b.WriteString(`</tbody></table>`)
 	}
@@ -416,18 +443,13 @@ func (h *handlers) handleBrowserObservations(w http.ResponseWriter, r *http.Requ
 	// R4-9: when re-fetch fails and rows are empty, attempt one additional fetch at page 1.
 	pg, needsRefetch := reclampPagination(reqPage, pageSize, total)
 	if needsRefetch && h.cfg.Store != nil {
-		if refetched, _, err := h.cfg.Store.ListRecentObservationsPaginated(project, query, obsType, pageSize, pg.Offset()); err == nil {
-			rows = refetched
-		} else {
+		rows = recoverPaginationRows(rows, pg.Offset(), func(offset int) ([]cloudstore.DashboardObservationRow, int, error) {
+			return h.cfg.Store.ListRecentObservationsPaginated(project, query, obsType, pageSize, offset)
+		}, func(err error) {
 			log.Printf("dashboard: re-fetch observations page %d: %v (using first-page rows)", pg.Page, err)
-			if len(rows) == 0 {
-				if fallback, _, fallbackErr := h.cfg.Store.ListRecentObservationsPaginated(project, query, obsType, pageSize, 0); fallbackErr == nil {
-					rows = fallback
-				} else {
-					log.Printf("dashboard: fallback observations page 1: %v", fallbackErr)
-				}
-			}
-		}
+		}, func(err error) {
+			log.Printf("dashboard: fallback observations page 1: %v", err)
+		})
 	}
 	partial := ObservationsPartial(rows, pg)
 	if isHTMXRequest(r) {
@@ -458,18 +480,13 @@ func (h *handlers) handleBrowserSessions(w http.ResponseWriter, r *http.Request)
 	// R4-9: when re-fetch fails and rows are empty, attempt one additional fetch at page 1.
 	pg, needsRefetch := reclampPagination(reqPage, pageSize, total)
 	if needsRefetch && h.cfg.Store != nil {
-		if refetched, _, err := h.cfg.Store.ListRecentSessionsPaginated(project, query, pageSize, pg.Offset()); err == nil {
-			rows = refetched
-		} else {
+		rows = recoverPaginationRows(rows, pg.Offset(), func(offset int) ([]cloudstore.DashboardSessionRow, int, error) {
+			return h.cfg.Store.ListRecentSessionsPaginated(project, query, pageSize, offset)
+		}, func(err error) {
 			log.Printf("dashboard: re-fetch sessions page %d: %v (using first-page rows)", pg.Page, err)
-			if len(rows) == 0 {
-				if fallback, _, fallbackErr := h.cfg.Store.ListRecentSessionsPaginated(project, query, pageSize, 0); fallbackErr == nil {
-					rows = fallback
-				} else {
-					log.Printf("dashboard: fallback sessions page 1: %v", fallbackErr)
-				}
-			}
-		}
+		}, func(err error) {
+			log.Printf("dashboard: fallback sessions page 1: %v", err)
+		})
 	}
 	partial := SessionsPartial(rows, pg)
 	if isHTMXRequest(r) {
@@ -500,18 +517,13 @@ func (h *handlers) handleBrowserPrompts(w http.ResponseWriter, r *http.Request) 
 	// R4-9: when re-fetch fails and rows are empty, attempt one additional fetch at page 1.
 	pg, needsRefetch := reclampPagination(reqPage, pageSize, total)
 	if needsRefetch && h.cfg.Store != nil {
-		if refetched, _, err := h.cfg.Store.ListRecentPromptsPaginated(project, query, pageSize, pg.Offset()); err == nil {
-			rows = refetched
-		} else {
+		rows = recoverPaginationRows(rows, pg.Offset(), func(offset int) ([]cloudstore.DashboardPromptRow, int, error) {
+			return h.cfg.Store.ListRecentPromptsPaginated(project, query, pageSize, offset)
+		}, func(err error) {
 			log.Printf("dashboard: re-fetch prompts page %d: %v (using first-page rows)", pg.Page, err)
-			if len(rows) == 0 {
-				if fallback, _, fallbackErr := h.cfg.Store.ListRecentPromptsPaginated(project, query, pageSize, 0); fallbackErr == nil {
-					rows = fallback
-				} else {
-					log.Printf("dashboard: fallback prompts page 1: %v", fallbackErr)
-				}
-			}
-		}
+		}, func(err error) {
+			log.Printf("dashboard: fallback prompts page 1: %v", err)
+		})
 	}
 	partial := PromptsPartial(rows, pg)
 	if isHTMXRequest(r) {
@@ -607,18 +619,13 @@ func (h *handlers) handleContributorsList(w http.ResponseWriter, r *http.Request
 	}
 	pg, needsRefetch := reclampPagination(reqPage, pageSize, total)
 	if needsRefetch && h.cfg.Store != nil {
-		if refetched, _, err := h.cfg.Store.ListContributorsPaginated(query, pageSize, pg.Offset()); err == nil {
-			rows = refetched
-		} else {
+		rows = recoverPaginationRows(rows, pg.Offset(), func(offset int) ([]cloudstore.DashboardContributorRow, int, error) {
+			return h.cfg.Store.ListContributorsPaginated(query, pageSize, offset)
+		}, func(err error) {
 			log.Printf("dashboard: re-fetch contributors list page %d: %v", pg.Page, err)
-			if len(rows) == 0 {
-				if fallback, _, fallbackErr := h.cfg.Store.ListContributorsPaginated(query, pageSize, 0); fallbackErr == nil {
-					rows = fallback
-				} else {
-					log.Printf("dashboard: fallback contributors list page 1: %v", fallbackErr)
-				}
-			}
-		}
+		}, func(err error) {
+			log.Printf("dashboard: fallback contributors list page 1: %v", err)
+		})
 	}
 	renderComponent(w, r, ContributorsListPartial(rows, pg))
 }
@@ -655,9 +662,12 @@ func (h *handlers) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		if sh, err := h.cfg.Store.SystemHealth(); err == nil {
 			health = &sh
 		}
-		if ctrls, err := h.cfg.Store.ListProjectSyncControls(); err == nil {
-			controls = ctrls
+		ctrls, err := h.cfg.Store.ListProjectSyncControls()
+		if err != nil {
+			h.renderStoreError(w, r, "admin", "Admin", err)
+			return
 		}
+		controls = ctrls
 	}
 	component := AdminPage(health, controls)
 	if isHTMXRequest(r) {
@@ -678,10 +688,12 @@ func (h *handlers) handleAdminProjectControls(w http.ResponseWriter, r *http.Req
 	}
 	var controls []cloudstore.ProjectSyncControl
 	if h.cfg.Store != nil {
-		// Degrade gracefully: empty controls if store fails.
-		if ctrls, err := h.cfg.Store.ListProjectSyncControls(); err == nil {
-			controls = ctrls
+		ctrls, err := h.cfg.Store.ListProjectSyncControls()
+		if err != nil {
+			h.renderStoreError(w, r, "admin", "Project controls", err)
+			return
 		}
+		controls = ctrls
 	}
 	component := AdminProjectsPage(controls)
 	if isHTMXRequest(r) {
@@ -712,28 +724,25 @@ func (h *handlers) handleProjectsList(w http.ResponseWriter, r *http.Request) {
 			renderComponentStatus(w, r, http.StatusBadGateway, EmptyState("Service Unavailable", "Dashboard data is temporarily unavailable."))
 			return
 		}
-		// Degrade gracefully: if controls fail, render without badges.
-		if ctrls, err := h.cfg.Store.ListProjectSyncControls(); err == nil {
-			controlsMap = controlsByProject(ctrls)
+		ctrls, err := h.cfg.Store.ListProjectSyncControls()
+		if err != nil {
+			log.Printf("dashboard: project controls store error: %v", err)
+			renderComponentStatus(w, r, http.StatusBadGateway, EmptyState("Service Unavailable", "Dashboard data is temporarily unavailable."))
+			return
 		}
+		controlsMap = controlsByProject(ctrls)
 	}
 	// R4-3: re-clamp to real total; re-fetch if requested page was beyond last page.
 	// R5-3: add tier-3 fallback — if clamped re-fetch fails AND rows are empty, attempt page 1.
 	pg, needsRefetch := reclampPagination(reqPage, pageSize, total)
 	if needsRefetch && h.cfg.Store != nil {
-		if refetched, _, err := h.cfg.Store.ListProjectsPaginated(query, pageSize, pg.Offset()); err == nil {
-			rows = refetched
-		} else {
+		rows = recoverPaginationRows(rows, pg.Offset(), func(offset int) ([]cloudstore.DashboardProjectRow, int, error) {
+			return h.cfg.Store.ListProjectsPaginated(query, pageSize, offset)
+		}, func(err error) {
 			log.Printf("dashboard: re-fetch projects list page %d: %v (using first-page rows)", pg.Page, err)
-			// R5-3: tier-3 fallback to page 1 when re-fetch fails and rows are empty.
-			if len(rows) == 0 {
-				if fallback, _, fallbackErr := h.cfg.Store.ListProjectsPaginated(query, pageSize, 0); fallbackErr == nil {
-					rows = fallback
-				} else {
-					log.Printf("dashboard: fallback projects list page 1: %v", fallbackErr)
-				}
-			}
-		}
+		}, func(err error) {
+			log.Printf("dashboard: fallback projects list page 1: %v", err)
+		})
 	}
 	renderComponent(w, r, ProjectsListPartial(rows, controlsMap, pg))
 }
@@ -798,7 +807,7 @@ func (h *handlers) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	component := ManagedUsersPage()
+	component := ManagedUsersPage(p.CanManageManagedUsers())
 	if isHTMXRequest(r) {
 		renderComponent(w, r, component)
 		return
@@ -827,7 +836,7 @@ func (h *handlers) handleAdminUsersList(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	renderComponent(w, r, ManagedUsersListPartial(rows))
+	renderComponent(w, r, ManagedUsersListPartial(rows, p.CanManageManagedUsers()))
 }
 
 // handleAdminHealth handles GET /dashboard/admin/health.
@@ -1114,18 +1123,13 @@ func (h *handlers) handleAdminAuditLogList(w http.ResponseWriter, r *http.Reques
 	// Tier 3: page-1 fallback when re-fetch fails and rows are empty.
 	pg, needsRefetch := reclampPagination(reqPage, pageSize, total)
 	if needsRefetch && h.cfg.Store != nil {
-		if refetched, _, err := h.cfg.Store.ListAuditEntriesPaginated(r.Context(), filter, pageSize, pg.Offset()); err == nil {
-			rows = refetched
-		} else {
+		rows = recoverPaginationRows(rows, pg.Offset(), func(offset int) ([]cloudstore.DashboardAuditRow, int, error) {
+			return h.cfg.Store.ListAuditEntriesPaginated(r.Context(), filter, pageSize, offset)
+		}, func(err error) {
 			log.Printf("dashboard: re-fetch audit log list page %d: %v (using first-page rows)", pg.Page, err)
-			if len(rows) == 0 {
-				if fallback, _, fallbackErr := h.cfg.Store.ListAuditEntriesPaginated(r.Context(), filter, pageSize, 0); fallbackErr == nil {
-					rows = fallback
-				} else {
-					log.Printf("dashboard: fallback audit log list page 1: %v", fallbackErr)
-				}
-			}
-		}
+		}, func(err error) {
+			log.Printf("dashboard: fallback audit log list page 1: %v", err)
+		})
 	}
 
 	renderComponent(w, r, AdminAuditLogListPartial(rows, pg, filter))

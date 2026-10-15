@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
 // ExportConfig holds all CLI flags for the obsidian-export command.
@@ -158,8 +158,21 @@ func (e *Exporter) Export() (*ExportResult, error) {
 			continue
 		}
 		absPath := filepath.Join(engRoot, relPath)
-		if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
-			result.Errors = append(result.Errors, fmt.Errorf("delete %s: %w", absPath, err))
+		cleanRoot := filepath.Clean(engRoot)
+		cleanPath := filepath.Clean(absPath)
+		if !strings.HasPrefix(cleanPath, cleanRoot+string(filepath.Separator)) {
+			result.Errors = append(result.Errors, fmt.Errorf("unsafe path rejected (would escape export root): %s", cleanPath))
+			continue
+		}
+		root, err := os.OpenRoot(engRoot)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("open export root for delete %s: %w", cleanPath, err))
+			continue
+		}
+		err = root.Remove(relPath)
+		_ = root.Close()
+		if err != nil && !os.IsNotExist(err) {
+			result.Errors = append(result.Errors, fmt.Errorf("delete %s: %w", cleanPath, err))
 		} else {
 			result.Deleted++
 			delete(state.Files, obs.ID)
@@ -293,8 +306,14 @@ func (e *Exporter) Export() (*ExportResult, error) {
 			continue
 		}
 		hubPath := filepath.Join(sessionsDir, sessionID+".md")
+		cleanSessionsDir := filepath.Clean(sessionsDir)
+		cleanHubPath := filepath.Clean(hubPath)
+		if !strings.HasPrefix(cleanHubPath, cleanSessionsDir+string(filepath.Separator)) {
+			result.Errors = append(result.Errors, fmt.Errorf("unsafe session hub path rejected (would escape sessions dir): %s", cleanHubPath))
+			continue
+		}
 		content := SessionHubMarkdown(sessionID, refs)
-		if err := os.WriteFile(hubPath, []byte(content), 0644); err != nil {
+		if err := writeSessionHub(sessionsDir, sessionID+".md", content); err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("write session hub %s: %w", hubPath, err))
 			continue
 		}
@@ -326,6 +345,29 @@ func (e *Exporter) Export() (*ExportResult, error) {
 	}
 
 	return result, nil
+}
+
+func writeSessionHub(sessionsDir, name, content string) error {
+	root, err := os.OpenRoot(sessionsDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = root.Close()
+	}()
+
+	if err := root.MkdirAll(filepath.Dir(name), 0755); err != nil {
+		return fmt.Errorf("mkdir session hub parent: %w", err)
+	}
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := file.WriteString(content); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // obsToRef converts a store.Observation to a lightweight ObsRef for hub building.

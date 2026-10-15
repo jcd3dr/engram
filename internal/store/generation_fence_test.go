@@ -1,0 +1,508 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	sqlite "modernc.org/sqlite"
+)
+
+func TestGenerationStickyAccessor(t *testing.T) {
+	g, path := newTestDatabaseGeneration(t, false, false)
+	s := &Store{generation: g}
+	accessor, ok := any(s).(interface{ GenerationError() error })
+	if !ok {
+		t.Fatal("store does not expose already observed generation error")
+	}
+	original := statFile
+	t.Cleanup(func() { statFile = original })
+	statFile = func(string) (os.FileInfo, error) {
+		t.Fatal("accessor probed filesystem")
+		return nil, nil
+	}
+	if err := accessor.GenerationError(); err != nil {
+		t.Fatalf("healthy accessor: %v", err)
+	}
+	statFile = original
+	replaceTestFile(t, path)
+	if err := accessor.GenerationError(); err != nil {
+		t.Fatalf("unobserved replacement: %v", err)
+	}
+	assertGenerationChanged(t, g.check())
+	statFile = func(string) (os.FileInfo, error) {
+		t.Fatal("sticky accessor probed filesystem")
+		return nil, nil
+	}
+	assertGenerationChanged(t, accessor.GenerationError())
+}
+
+func TestDatabaseGeneration(t *testing.T) {
+	t.Run("adopts sidecars when first observed", func(t *testing.T) {
+		generation, dbPath := newTestDatabaseGeneration(t, false, false)
+		if err := generation.check(); err != nil {
+			t.Fatalf("initial check: %v", err)
+		}
+		writeTestFile(t, dbPath+"-wal")
+		writeTestFile(t, dbPath+"-shm")
+		if err := generation.check(); err != nil {
+			t.Fatalf("adopt sidecars: %v", err)
+		}
+	})
+
+	for _, sidecar := range []string{"", "-wal", "-shm"} {
+		sidecar := sidecar
+		t.Run("detects replacement "+sidecarName(sidecar), func(t *testing.T) {
+			generation, dbPath := newTestDatabaseGeneration(t, sidecar == "-wal", sidecar == "-shm")
+			replaceTestFile(t, dbPath+sidecar)
+			assertGenerationChanged(t, generation.check())
+			assertGenerationChanged(t, generation.check())
+		})
+
+		t.Run("detects disappearance "+sidecarName(sidecar), func(t *testing.T) {
+			generation, dbPath := newTestDatabaseGeneration(t, sidecar == "-wal", sidecar == "-shm")
+			if err := os.Remove(dbPath + sidecar); err != nil {
+				t.Fatalf("remove generation file: %v", err)
+			}
+			assertGenerationChanged(t, generation.check())
+			if sidecar != "" {
+				writeTestFile(t, dbPath+sidecar)
+				assertGenerationChanged(t, generation.check())
+			}
+		})
+	}
+}
+
+func TestDatabaseGenerationRecoversFromStatError(t *testing.T) {
+	generation, dbPath := newTestDatabaseGeneration(t, false, false)
+	original := statFile
+	t.Cleanup(func() { statFile = original })
+	statErr := errors.New("transient stat error")
+	failed := false
+	statFile = func(path string) (os.FileInfo, error) {
+		if path == dbPath && !failed {
+			failed = true
+			return nil, statErr
+		}
+		return original(path)
+	}
+	if err := generation.check(); err != statErr {
+		t.Fatalf("check error = %v, want transient stat error", err)
+	}
+	if err := generation.check(); err != nil {
+		t.Fatalf("check after transient stat error: %v", err)
+	}
+}
+
+func TestGenerationFenceRejectsUnsafeOperations(t *testing.T) {
+	t.Run("rejects before operation", func(t *testing.T) {
+		generation, dbPath := newTestDatabaseGeneration(t, false, false)
+		called := false
+		conn := generationConn{Conn: &testFenceConn{exec: func() { called = true }}, generation: generation}
+		replaceTestFile(t, dbPath)
+		_, err := conn.ExecContext(context.Background(), "UPDATE test", nil)
+		assertGenerationChanged(t, err)
+		if called {
+			t.Fatal("operation ran after generation change")
+		}
+	})
+
+	t.Run("rejects after write", func(t *testing.T) {
+		generation, dbPath := newTestDatabaseGeneration(t, false, false)
+		conn := generationConn{Conn: &testFenceConn{exec: func() { replaceTestFile(t, dbPath) }}, generation: generation}
+		_, err := conn.ExecContext(context.Background(), "UPDATE test", nil)
+		assertGenerationChanged(t, err)
+	})
+
+	t.Run("rejects after commit", func(t *testing.T) {
+		generation, dbPath := newTestDatabaseGeneration(t, false, false)
+		tx := generationTx{Tx: &testFenceTx{commit: func() { replaceTestFile(t, dbPath) }}, generation: generation}
+		assertGenerationChanged(t, tx.Commit())
+	})
+
+	t.Run("rejects while iterating rows", func(t *testing.T) {
+		generation, dbPath := newTestDatabaseGeneration(t, false, false)
+		conn := generationConn{Conn: &testFenceConn{rows: &testFenceRows{next: func() { replaceTestFile(t, dbPath) }}}, generation: generation}
+		rows, err := conn.QueryContext(context.Background(), "SELECT test", nil)
+		if err != nil {
+			t.Fatalf("query rows: %v", err)
+		}
+		assertGenerationChanged(t, rows.Next(make([]driver.Value, 1)))
+	})
+}
+
+func TestGenerationConnExposesFileControlForPrimeConnection(t *testing.T) {
+	generation, _ := newTestDatabaseGeneration(t, false, false)
+	base := &testFenceFileControlConn{}
+	conn := generationConn{Conn: base, generation: generation}
+
+	fc, ok := any(conn).(sqlite.FileControl)
+	if !ok {
+		t.Fatal("generation connection does not expose sqlite.FileControl")
+	}
+	mode, err := fc.FileControlPersistWAL("main", 1)
+	if err != nil {
+		t.Fatalf("FileControlPersistWAL: %v", err)
+	}
+	if mode != 1 || base.dbName != "main" || base.mode != 1 {
+		t.Fatalf("persist WAL = (%d, %q, %d), want (1, main, 1)", mode, base.dbName, base.mode)
+	}
+}
+
+func TestGenerationConnFileControlDataVersion(t *testing.T) {
+	underlyingErr := errors.New("data version failed")
+	for _, tt := range []struct {
+		name        string
+		unsupported bool
+		before      bool
+		during      bool
+		baseErr     error
+	}{
+		{name: "forwards value and database name"},
+		{name: "unsupported connection", unsupported: true},
+		{name: "preserves underlying error identity", baseErr: underlyingErr},
+		{name: "rejects generation change before call", before: true},
+		{name: "rejects generation replacement during successful call", during: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			generation, dbPath := newTestDatabaseGeneration(t, false, false)
+			// Use a value above MaxInt32 to protect the uint32 forwarding contract.
+			const version uint32 = 0xfedcba98
+			base := &testFenceFileControlConn{dataVersion: version, dataVersionErr: tt.baseErr}
+			if tt.during {
+				base.onDataVersion = func() { replaceTestFile(t, dbPath) }
+			}
+			var underlying driver.Conn = base
+			if tt.unsupported {
+				underlying = &testFenceConn{}
+			}
+			conn := generationConn{Conn: underlying, generation: generation}
+			// Local structural assertion keeps this regression runnable with the
+			// old sqlite interface: an absent bridge fails here, not at compilation.
+			fc, ok := any(conn).(interface {
+				FileControlDataVersion(string) (uint32, error)
+			})
+			if !ok {
+				t.Fatal("generation connection does not expose FileControlDataVersion")
+			}
+			if tt.before {
+				replaceTestFile(t, dbPath)
+			}
+			value, err := fc.FileControlDataVersion("attached")
+			switch {
+			case tt.before || tt.during:
+				assertGenerationChanged(t, err)
+			case tt.unsupported:
+				if err == nil || err.Error() != "database connection does not implement sqlite.FileControl" {
+					t.Fatalf("error = %v, want unsupported sqlite.FileControl error", err)
+				}
+			case tt.baseErr != nil:
+				if err != underlyingErr {
+					t.Fatalf("error = %v, want original underlying error", err)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("FileControlDataVersion: %v", err)
+				}
+			}
+			wantValue := version
+			if tt.before || tt.during || tt.unsupported || tt.baseErr != nil {
+				wantValue = 0
+			}
+			if value != wantValue {
+				t.Errorf("data version = %#x, want %#x", value, wantValue)
+			}
+			wantCalls := 1
+			wantDBName := "attached"
+			if tt.before || tt.unsupported {
+				wantCalls, wantDBName = 0, ""
+			}
+			if base.dataVersionCalls != wantCalls || base.dataVersionDBName != wantDBName {
+				t.Errorf("underlying calls/database = (%d, %q), want (%d, %q)", base.dataVersionCalls, base.dataVersionDBName, wantCalls, wantDBName)
+			}
+		})
+	}
+}
+
+func TestNewRejectsGenerationChangedBeforeSQLiteOpens(t *testing.T) {
+	original := openDB
+	t.Cleanup(func() { openDB = original })
+	openDB = func(dbPath string, generation *databaseGeneration) (*sql.DB, error) {
+		replaceTestFile(t, dbPath)
+		return original(dbPath, generation)
+	}
+	cfg := FallbackConfig(t.TempDir())
+	_, err := New(cfg)
+	assertGenerationChanged(t, err)
+}
+
+func TestStatsPropagatesGenerationChange(t *testing.T) {
+	s := newTestStore(t)
+	s.hooks.queryIt = func(queryer, string, ...any) (rowScanner, error) { return nil, ErrDatabaseGenerationChanged }
+	_, err := s.Stats()
+	assertGenerationChanged(t, err)
+}
+
+func TestStoreRejectsOperationsAfterDatabaseIdentityChange(t *testing.T) {
+	// Do not parallelize: statFile is a package-global seam.
+	s := newTestStore(t)
+	if err := s.CreateSession("healthy-session", "generation-test", ""); err != nil {
+		t.Fatalf("healthy write: %v", err)
+	}
+	stats, err := s.Stats()
+	if err != nil {
+		t.Fatalf("healthy Stats: %v", err)
+	}
+	if stats.TotalSessions != 1 {
+		t.Fatalf("healthy sessions = %d, want 1", stats.TotalSessions)
+	}
+
+	dbPath := filepath.Join(s.DataDir(), "engram.db")
+	replacementPath := filepath.Join(t.TempDir(), "different-file")
+	writeTestFile(t, replacementPath)
+	original := statFile
+	// Registered after newTestStore so the seam is restored before store close;
+	// both run before their temporary directories are removed.
+	t.Cleanup(func() { statFile = original })
+	replacementInfo, err := original(replacementPath)
+	if err != nil {
+		t.Fatalf("stat different file: %v", err)
+	}
+	if os.SameFile(s.generation.files[0], replacementInfo) {
+		t.Fatal("different file retained captured database identity")
+	}
+	// Simulate identity drift, not an actual live-file replacement: SQLite's
+	// open DB/WAL/SHM files are left untouched for Windows portability.
+	statFile = func(path string) (os.FileInfo, error) {
+		if path == dbPath {
+			return replacementInfo, nil
+		}
+		return original(path)
+	}
+	_, err = s.Stats()
+	assertGenerationChanged(t, err)
+	assertGenerationChanged(t, s.CreateSession("rejected-session", "generation-test", ""))
+
+	statFile = original
+	_, err = s.Stats()
+	assertGenerationChanged(t, err)
+	assertGenerationChanged(t, s.CreateSession("sticky-rejected-session", "generation-test", ""))
+
+	// Independently inspect persisted data through the real, unfenced driver.
+	// This does not reset the store's sticky generation failure.
+	raw, err := sql.Open("sqlite", storeDSN(dbPath))
+	if err != nil {
+		t.Fatalf("open unfenced database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := raw.Close(); err != nil {
+			t.Errorf("close unfenced database: %v", err)
+		}
+	})
+	var sessions int
+	if err := raw.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&sessions); err != nil {
+		t.Fatalf("inspect persisted sessions: %v", err)
+	}
+	if sessions != 1 {
+		t.Fatalf("persisted sessions = %d, want only healthy session", sessions)
+	}
+}
+
+func TestWithReadTxPropagatesRollbackGenerationChange(t *testing.T) {
+	callbackErr := errors.New("callback failed")
+	for _, tt := range []struct {
+		name                 string
+		callbackErr          error
+		invalidateGeneration bool
+		wantGenerationError  bool
+	}{
+		{name: "after successful callback", invalidateGeneration: true, wantGenerationError: true},
+		{name: "alongside callback error", callbackErr: callbackErr, invalidateGeneration: true, wantGenerationError: true},
+		{name: "preserves callback error when rollback succeeds", callbackErr: callbackErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStore(t)
+			err := s.withReadTx(func(tx *sql.Tx) error {
+				var value int
+				if err := tx.QueryRow("SELECT 1").Scan(&value); err != nil {
+					t.Fatalf("query in read transaction: %v", err)
+				}
+				if tt.invalidateGeneration {
+					s.generation.mu.Lock()
+					s.generation.err = ErrDatabaseGenerationChanged
+					s.generation.mu.Unlock()
+				}
+				return tt.callbackErr
+			})
+
+			if tt.wantGenerationError {
+				assertGenerationChanged(t, err)
+			} else if errors.Is(err, ErrDatabaseGenerationChanged) {
+				t.Fatalf("error = %v, did not want generation error", err)
+			}
+			if tt.callbackErr != nil && !errors.Is(err, tt.callbackErr) {
+				t.Fatalf("error = %v, want callback error", err)
+			}
+		})
+	}
+}
+
+func TestGenerationRowsNextResultSetIsFenced(t *testing.T) {
+	generation, dbPath := newTestDatabaseGeneration(t, false, false)
+	base := &testFenceRows{hasNextResultSet: true, nextResultSet: func() { replaceTestFile(t, dbPath) }}
+	rows := generationRows{Rows: base, generation: generation}
+	if !rows.HasNextResultSet() {
+		t.Fatal("HasNextResultSet = false, want true")
+	}
+	assertGenerationChanged(t, rows.NextResultSet())
+	if !base.closed {
+		t.Fatal("rows were not closed after generation change")
+	}
+}
+
+func newTestDatabaseGeneration(t *testing.T, wal, shm bool) (*databaseGeneration, string) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "engram.db")
+	writeTestFile(t, dbPath)
+	if wal {
+		writeTestFile(t, dbPath+"-wal")
+	}
+	if shm {
+		writeTestFile(t, dbPath+"-shm")
+	}
+	generation, err := newDatabaseGeneration(dbPath)
+	if err != nil {
+		t.Fatalf("capture database generation: %v", err)
+	}
+	return generation, dbPath
+}
+
+func writeTestFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("database generation"), 0600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func replaceTestFile(t *testing.T, path string) {
+	t.Helper()
+	previous, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	_ = os.SameFile(previous, previous)
+	replacement := path + ".replacement"
+	writeTestFile(t, replacement)
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove %s: %v", path, err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatalf("replace %s: %v", path, err)
+	}
+	current, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat replacement %s: %v", path, err)
+	}
+	if os.SameFile(previous, current) {
+		t.Fatalf("replacement for %s retained its identity", path)
+	}
+}
+
+func sidecarName(sidecar string) string {
+	if sidecar == "" {
+		return "database"
+	}
+	return sidecar[1:]
+}
+
+func assertGenerationChanged(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrDatabaseGenerationChanged) {
+		t.Fatalf("error = %v, want ErrDatabaseGenerationChanged", err)
+	}
+}
+
+type testFenceConn struct {
+	exec func()
+	rows *testFenceRows
+}
+
+type testFenceFileControlConn struct {
+	testFenceConn
+	dbName            string
+	mode              int
+	dataVersion       uint32
+	dataVersionErr    error
+	dataVersionCalls  int
+	dataVersionDBName string
+	onDataVersion     func()
+}
+
+func (c *testFenceFileControlConn) FileControlPersistWAL(dbName string, mode int) (int, error) {
+	c.dbName, c.mode = dbName, mode
+	return mode, nil
+}
+
+func (c *testFenceFileControlConn) FileControlDataVersion(dbName string) (uint32, error) {
+	c.dataVersionCalls++
+	c.dataVersionDBName = dbName
+	if c.onDataVersion != nil {
+		c.onDataVersion()
+	}
+	return c.dataVersion, c.dataVersionErr
+}
+
+func (c *testFenceConn) Prepare(string) (driver.Stmt, error) { return testFenceStmt{}, nil }
+func (c *testFenceConn) Close() error                        { return nil }
+func (c *testFenceConn) Begin() (driver.Tx, error)           { return testFenceTx{}, nil }
+func (c *testFenceConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	if c.exec != nil {
+		c.exec()
+	}
+	return driver.RowsAffected(1), nil
+}
+func (c *testFenceConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	return c.rows, nil
+}
+
+type testFenceStmt struct{}
+
+func (testFenceStmt) Close() error                               { return nil }
+func (testFenceStmt) NumInput() int                              { return -1 }
+func (testFenceStmt) Exec([]driver.Value) (driver.Result, error) { return driver.RowsAffected(1), nil }
+func (testFenceStmt) Query([]driver.Value) (driver.Rows, error)  { return &testFenceRows{}, nil }
+
+type testFenceTx struct{ commit func() }
+
+func (t testFenceTx) Commit() error {
+	if t.commit != nil {
+		t.commit()
+	}
+	return nil
+}
+func (testFenceTx) Rollback() error { return nil }
+
+type testFenceRows struct {
+	next, nextResultSet      func()
+	hasNextResultSet, closed bool
+}
+
+func (r *testFenceRows) Columns() []string { return []string{"value"} }
+func (r *testFenceRows) Close() error      { r.closed = true; return nil }
+func (r *testFenceRows) Next([]driver.Value) error {
+	if r.next != nil {
+		r.next()
+	}
+	return nil
+}
+func (r *testFenceRows) HasNextResultSet() bool { return r.hasNextResultSet }
+func (r *testFenceRows) NextResultSet() error {
+	if r.nextResultSet != nil {
+		r.nextResultSet()
+	}
+	return nil
+}
