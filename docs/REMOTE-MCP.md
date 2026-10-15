@@ -27,7 +27,7 @@ or set `ENGRAM_MCP_TRANSPORT=http` (any of `--transport=http`,
 |---|---|---|
 | `MCP_BEARER_TOKEN` | unset | If set, allows direct `Authorization: Bearer <token>` access to `/mcp`, bypassing the OAuth flow entirely (CLI-style auth path). |
 | `ENGRAM_HTTP_ADDR` / `ENGRAM_MCP_PORT` | `0.0.0.0:8080` | Listen address. |
-| `ENGRAM_PROJECT` / `--project` | auto-detected | Pins the project for all tool calls in this stateless HTTP server (reuses the existing `mcp.MCPConfig.DefaultProject` mechanism already used by stdio mode's `--project` flag). Required in practice for remote mode since there is no per-connection cwd/git context to auto-detect from. |
+| `ENGRAM_PROJECT` / `--project` | unset (recommended) | Do NOT set on the remote server. Engram is multi-project: every `mem_*` call must pass `project` explicitly. A process-level default would make every client write into one project. |
 
 ## Endpoints
 
@@ -37,7 +37,7 @@ or set `ENGRAM_MCP_TRANSPORT=http` (any of `--transport=http`,
 - `POST /register` — RFC 7591 Dynamic Client Registration. Stateless: the returned `client_id` is itself an encrypted blob, nothing is persisted server-side.
 - `GET/POST /authorize` — Authorization Code + PKCE (S256) flow. GET renders the owner-key gate HTML form; POST verifies the owner key (constant-time compare, explicit visible error on mismatch — never silent/hanging) and redirects with a code on success.
 - `POST /token` — exchanges `authorization_code` or `refresh_token` grants for an access + refresh token pair (access TTL 1h, refresh TTL 90d).
-- `ANY /mcp` — the actual MCP Streamable HTTP endpoint (`mark3labs/mcp-go`'s `NewStreamableHTTPServer`, same `*server.MCPServer` object used by stdio mode, so all 20 MCP tools are identical). Protected by `RequireBearer` middleware: accepts either `MCP_BEARER_TOKEN` (if configured) or a valid encrypted access token.
+- `ANY /mcp` — the actual MCP Streamable HTTP endpoint (`mark3labs/mcp-go`'s `NewStreamableHTTPServer`, same `*server.MCPServer` object used by stdio mode, so all 22 MCP tools are identical). Protected by `RequireBearer` middleware: accepts either `MCP_BEARER_TOKEN` (if configured) or a valid encrypted access token.
 
 ## Design notes
 
@@ -63,3 +63,21 @@ BASE_URL=... BEARER_TOKEN=... ./scripts/test-remote-mcp.sh --bearer-only
 It exercises `/health`, discovery, DCR, the owner-key gate (wrong key then
 correct key), PKCE token exchange, and MCP `initialize`/`tools/list`/
 `mem_save`/`mem_search`.
+
+## Project model (multi-project)
+
+Engram stores memory for many projects. The remote server has no default project.
+Clients pass the project on each call: `mem_save`, `mem_search`, `mem_context`,
+`mem_session_summary`, `mem_save_prompt`, `mem_timeline`, `mem_stats`, `mem_review`,
+`mem_doctor`. The server instructions (sent at MCP initialize) state this rule.
+
+## Plugins
+
+`plugin/claude-code` and `plugin/codex` connect to this endpoint over HTTP
+(`.mcp.json`, `"type": "http"`). Their hooks inject the protocol and the project
+name (derived from the git root or the working directory) at session start and
+after compaction. They do not start a local server or write a local database.
+Install Claude Code's plugin from this repository:
+
+    /plugin marketplace add jcd3dr/engram
+    /plugin install engram@engram

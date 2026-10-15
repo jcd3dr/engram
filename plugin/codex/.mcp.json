@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "engram": {
-      "command": "engram",
-      "args": ["mcp", "--tools=agent"]
+      "type": "http",
+      "url": "https://engram-mcp.jcdcruz.com/mcp"
     }
   }
 }

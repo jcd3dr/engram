@@ -1,60 +1,17 @@
 {
+  "description": "Engram remote memory: protocol and project name at session start and after compaction.",
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup|resume|clear",
+        "matcher": "startup|clear",
         "hooks": [
-          {
-            "type": "command",
-            "command": "\"${PLUGIN_ROOT}/scripts/session-start.sh\"",
-            "timeout": 10,
-            "statusMessage": "Loading engram memory..."
-          }
+          { "type": "command", "command": "\"${PLUGIN_ROOT}/scripts/session-start.sh\"", "timeout": 5, "statusMessage": "Loading engram memory protocol..." }
         ]
       },
       {
         "matcher": "compact",
         "hooks": [
-          {
-            "type": "command",
-            "command": "\"${PLUGIN_ROOT}/scripts/post-compaction.sh\"",
-            "timeout": 10,
-            "statusMessage": "Recovering engram context after compaction..."
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${PLUGIN_ROOT}/scripts/user-prompt-submit.sh\"",
-            "timeout": 2
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${PLUGIN_ROOT}/scripts/subagent-stop.sh\"",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${PLUGIN_ROOT}/scripts/session-stop.sh\"",
-            "timeout": 5
-          }
+          { "type": "command", "command": "\"${PLUGIN_ROOT}/scripts/post-compaction.sh\"", "timeout": 5, "statusMessage": "Recovering engram context after compaction..." }
         ]
       }
     ]

@@ -8,7 +8,7 @@ Live instance: `engram-mcp` in the "MCP Servers" Coolify project, public URL
 1. Application: Dockerfile build pack, source `docker/mcp/Dockerfile`, port 8080.
 2. Env vars (set via Coolify's env-var UI, `is_secret=true` for the three
    secrets — never commit real values): `ENGRAM_OWNER_KEY`, `ENCRYPTION_KEY`,
-   `MCP_BEARER_TOKEN`, `ENGRAM_PUBLIC_URL`, `ENGRAM_PROJECT`,
+   `MCP_BEARER_TOKEN`, `ENGRAM_PUBLIC_URL` (do NOT set `ENGRAM_PROJECT`: the remote server is multi-project),
    `ENGRAM_HTTP_ADDR`, `ENGRAM_DATA_DIR`. See `docs/REMOTE-MCP.md`.
 3. Domain + TLS: set the application's FQDN to the desired subdomain;
    Coolify's Traefik integration issues a Let's Encrypt certificate
