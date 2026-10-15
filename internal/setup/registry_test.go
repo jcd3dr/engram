@@ -109,31 +109,23 @@ func TestInstallDeclarativeAgentsRegisterMCPAndInstructions(t *testing.T) {
 				t.Fatalf("expected 2 files for %s, got %d", agent.slug, result.Files)
 			}
 
-			// MCP entry shape per format.
 			entry := readEngramEntry(t, agent.mcpPath(), agent.topKey)
-			switch agent.mcpFormat {
-			case opencodeObject:
-				if entry["type"] != "local" {
-					t.Errorf("%s: expected type local, got %#v", agent.slug, entry["type"])
+			// MCP entry must be the hosted remote shape, never a local command.
+			if entry["url"] != engramRemoteMCPURL {
+				t.Errorf("%s: expected url %q, got %#v", agent.slug, engramRemoteMCPURL, entry["url"])
+			}
+			if _, hasCommand := entry["command"]; hasCommand {
+				t.Errorf("%s: remote entry must not carry a local command", agent.slug)
+			}
+			if agent.mcpFormat == opencodeObject {
+				if entry["type"] != "remote" {
+					t.Errorf("%s: expected type remote, got %#v", agent.slug, entry["type"])
 				}
 				if entry["enabled"] != true {
 					t.Errorf("%s: expected enabled true, got %#v", agent.slug, entry["enabled"])
 				}
-				cmd, ok := entry["command"].([]any)
-				if !ok || len(cmd) != 3 || cmd[0] != testEngramBin || cmd[1] != "mcp" || cmd[2] != "--tools=agent" {
-					t.Errorf("%s: unexpected command array %#v", agent.slug, entry["command"])
-				}
-			default:
-				if entry["command"] != testEngramBin {
-					t.Errorf("%s: expected command %q, got %#v", agent.slug, testEngramBin, entry["command"])
-				}
-				args, ok := entry["args"].([]any)
-				if !ok || len(args) != 2 || args[0] != "mcp" || args[1] != "--tools=agent" {
-					t.Errorf("%s: unexpected args %#v", agent.slug, entry["args"])
-				}
-				if agent.mcpFormat == serversObject && entry["type"] != "stdio" {
-					t.Errorf("%s: expected type stdio, got %#v", agent.slug, entry["type"])
-				}
+			} else if entry["type"] != "http" {
+				t.Errorf("%s: expected type http, got %#v", agent.slug, entry["type"])
 			}
 
 			// Instruction surface contains the FULL protocol text. Declarative
@@ -376,7 +368,7 @@ func TestInjectMCPHandlesNullServersObject(t *testing.T) {
 		t.Fatalf("injectMCP with null servers: %v", err)
 	}
 	entry := readEngramEntry(t, path, "mcpServers")
-	if entry["command"] != testEngramBin {
+	if entry["url"] != engramRemoteMCPURL {
 		t.Errorf("expected engram entry written, got %#v", entry)
 	}
 }

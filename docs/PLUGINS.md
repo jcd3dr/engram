@@ -17,7 +17,8 @@
 
 | Integration | Coverage |
 |---|---|
-| OpenCode | TypeScript plugin plus MCP registration via `engram setup opencode`. |
+| OpenCode | TypeScript plugin plus a remote MCP entry via `engram setup opencode`. |
+| Pi | Extension plus a remote MCP entry via `pi-engram init`. |
 | Claude Code | Marketplace/bundled plugin plus best-effort durable user MCP config via `engram setup claude-code`. |
 | Codex | Codex plugin assets under `plugin/codex/`; `engram setup codex` best-effort installs the marketplace plugin and writes MCP/instruction config. |
 | Pi | Pi package under `plugin/pi/` exposes Pi-native HTTP memory tools and configures MCP through `pi-mcp-adapter`. |
@@ -26,53 +27,32 @@
 
 ## OpenCode Plugin
 
-For [OpenCode](https://opencode.ai) users, a thin TypeScript plugin adds enhanced session management on top of the MCP tools:
+OpenCode connects to the hosted Engram MCP server through a remote MCP entry. The plugin adds the protocol, the project rule and compaction recovery. It runs no local binary and opens no local database.
 
-```bash
-# Install via engram (recommended — works from Homebrew or binary install)
-engram setup opencode
+Install:
 
-# Or manually: cp plugin/opencode/engram.ts ~/.config/opencode/plugins/
+1. Add the remote MCP server to `opencode.json`:
+
+```json
+{
+  "mcp": {
+    "engram": {
+      "type": "remote",
+      "url": "https://engram-mcp.jcdcruz.com/mcp",
+      "enabled": true
+    }
+  }
+}
 ```
 
-The plugin auto-starts the HTTP server if it's not already running — no manual `engram serve` needed.
+2. Install the plugin: `engram setup opencode` (writes the plugin and the MCP entry), or copy it by hand with `cp plugin/opencode/engram.ts ~/.config/opencode/plugins/`.
 
-> **Local model compatibility:** The plugin works with all models, including local ones served via llama.cpp, Ollama, or similar. The Memory Protocol is concatenated into the existing system prompt (not added as a separate system message), so models with strict Jinja templates (Qwen, Mistral/Ministral) work correctly.
+### What the plugin does
 
-### What the Plugin Does
+- Injects the Engram protocol and `PROJECT FOR THIS SESSION` into the system prompt. The project is the basename of the git top-level directory, lowercased, the same rule as the Claude Code and Pi plugins.
+- After a compaction, tells the agent to save the compacted summary with `mem_session_summary` before any other work.
 
-The plugin:
-- **Auto-starts** the engram server if not running
-- **Auto-imports** git-synced memories from `.engram/manifest.json` if present in the project
-- **Creates sessions** on-demand via `ensureSession()` (resilient to restarts/reconnects)
-- **Injects the Memory Protocol** into the agent's system prompt via `chat.system.transform` — strict rules for when to save, when to search, and a mandatory session close protocol. The protocol is concatenated into the existing system message (not pushed as a separate one), ensuring compatibility with models that only accept a single system block (Qwen, Mistral/Ministral via llama.cpp, etc.)
-- **Injects previous session context** into the compaction prompt
-- **Instructs the compressor** to tell the new agent to persist the compacted summary via `mem_session_summary`
-- **Strips `<private>` tags** before sending data
-- **Enables** `opencode-subagent-statusline` in `tui.json` or `tui.jsonc` during `engram setup opencode`, adding a live sub-agent monitor to OpenCode's sidebar/home footer. To disable it later, remove `"opencode-subagent-statusline"` from the `"plugin"` array in your TUI config and restart OpenCode.
-
-**No raw tool call recording** — the agent handles memory through curated saves such as `mem_save` and `mem_session_summary`. `mem_save` may best-effort attach prompt context, but only when that prompt was already fed to the same MCP process lifecycle.
-
-### Memory Protocol (injected via system prompt)
-
-The plugin injects a strict protocol into every agent message:
-
-- **WHEN TO SAVE**: Mandatory after bugfixes, decisions, discoveries, config changes, patterns, preferences
-- **WHEN TO SEARCH**: Reactive (user says "remember"/"recordar") + proactive (starting work that might overlap past sessions)
-- **SESSION CLOSE**: Mandatory `mem_session_summary` before ending — "This is NOT optional. If you skip this, the next session starts blind."
-- **AFTER COMPACTION**: Immediately call `mem_context` to recover state
-
-### Three Layers of Memory Resilience
-
-The OpenCode plugin uses a defense-in-depth strategy to ensure memories survive compaction:
-
-| Layer | Mechanism | Survives Compaction? |
-|-------|-----------|---------------------|
-| **System Prompt** | `MEMORY_INSTRUCTIONS` concatenated into existing system prompt via `chat.system.transform` | Always present |
-| **Compaction Hook** | Auto-saves checkpoint + injects context + reminds compressor | Fires during compaction |
-| **Agent Config** | "After compaction, call `mem_context`" in agent prompt | Always present |
-
----
+`engram setup opencode` also enables `opencode-subagent-statusline` in `tui.json`. To disable it, remove that entry from the `"plugin"` array and restart OpenCode.
 
 ## Claude Code Plugin
 

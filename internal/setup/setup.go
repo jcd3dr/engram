@@ -1,10 +1,8 @@
 // Package setup handles agent plugin installation.
 //
-//   - OpenCode: copies embedded plugin file to ~/.config/opencode/plugins/
-//     (patching ENGRAM_BIN to bake in the absolute binary path as a final
-//     fallback) and injects MCP registration in opencode.json using the
-//     resolved absolute binary path so child processes never require PATH
-//     resolution in headless/systemd environments.
+//   - OpenCode: copies the embedded plugin (protocol and project rule only) to
+//     ~/.config/opencode/plugins/ and registers the hosted Engram MCP server as a
+//     remote entry in opencode.json. No local binary or database is involved.
 //   - Claude Code: runs `claude plugin marketplace add` + `claude plugin install`,
 //     then writes a durable MCP config to ~/.claude/mcp/engram.json using the
 //     absolute binary path so the subprocess never needs PATH resolution.
@@ -115,18 +113,12 @@ func claudeCodePermissionTools(agentTools map[string]bool) []string {
 }
 
 // codexEngramBlock is the canonical Codex TOML MCP block.
-// Command is always the bare "engram" name in this constant because
-// upsertCodexEngramBlock generates the actual content via codexEngramBlockStr()
-// which uses resolveEngramCommand() at runtime. This constant is kept for tests
-// that verify idempotency against the already-written string when os.Executable
-// returns "engram" (fallback path).
-const codexEngramBlock = "[mcp_servers.engram]\ncommand = \"engram\"\nargs = [\"mcp\", \"--tools=agent\"]"
+// codexEngramBlock is the Codex TOML block for the remote engram MCP server.
+const codexEngramBlock = "[mcp_servers.engram]\nurl = \"" + engramRemoteMCPURL + "\""
 
-// codexEngramBlockStr returns the Codex TOML block for the engram MCP server,
-// using the resolved absolute binary path from os.Executable().
+// codexEngramBlockStr returns the Codex TOML block for the engram MCP server.
 func codexEngramBlockStr() string {
-	cmd := resolveEngramCommand()
-	return "[mcp_servers.engram]\ncommand = " + fmt.Sprintf("%q", cmd) + "\nargs = [\"mcp\", \"--tools=agent\"]"
+	return "[mcp_servers.engram]\nurl = \"" + engramRemoteMCPURL + "\""
 }
 
 const memoryProtocolMarkdown = `## Engram Persistent Memory — Protocol
@@ -416,8 +408,7 @@ func ensurePiMCPConfig(mcpPath string) (bool, error) {
 		return false, nil
 	}
 	server := map[string]any{
-		"command":     resolveEngramCommand(),
-		"args":        []string{"mcp", "--tools=agent"},
+		"url":         engramRemoteMCPURL,
 		"lifecycle":   "lazy",
 		"directTools": false,
 	}
@@ -486,42 +477,6 @@ func rawArrayContainsString(values []json.RawMessage, target string) bool {
 
 // ─── OpenCode ────────────────────────────────────────────────────────────────
 
-// patchEngramBINLine rewrites the ENGRAM_BIN constant declaration in the
-// plugin source so the installed copy contains an absolute fallback path.
-//
-// Original line in source:
-//
-//	const ENGRAM_BIN = process.env.ENGRAM_BIN ?? "engram"
-//
-// Patched line in installed copy:
-//
-//	const ENGRAM_BIN = process.env.ENGRAM_BIN ?? Bun.which("engram") ?? "/abs/path/engram"
-//
-// Priority (left to right, first truthy wins):
-//  1. ENGRAM_BIN env var — explicit user override, always respected.
-//  2. Bun.which("engram") — runtime PATH lookup; works in interactive shells.
-//  3. Absolute baked-in path — works in headless/systemd where PATH is stripped.
-//
-// If absBin is already bare "engram" (os.Executable fallback) we don't add it
-// as the third fallback because it would be redundant with Bun.which("engram").
-func patchEngramBINLine(src []byte, absBin string) []byte {
-	const marker = `const ENGRAM_BIN = process.env.ENGRAM_BIN ?? "engram"`
-
-	var replacement string
-	if absBin == "engram" {
-		// os.Executable failed — add Bun.which but no baked-in absolute path
-		replacement = `const ENGRAM_BIN = process.env.ENGRAM_BIN ?? Bun.which("engram") ?? "engram"`
-	} else {
-		// Normal case: bake in the absolute path as final fallback
-		replacement = fmt.Sprintf(
-			`const ENGRAM_BIN = process.env.ENGRAM_BIN ?? Bun.which("engram") ?? %q`,
-			absBin,
-		)
-	}
-
-	return []byte(strings.Replace(string(src), marker, replacement, 1))
-}
-
 func installOpenCode() (*Result, error) {
 	dir := openCodePluginDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -533,14 +488,6 @@ func installOpenCode() (*Result, error) {
 		return nil, fmt.Errorf("read embedded engram.ts: %w", err)
 	}
 
-	// Patch ENGRAM_BIN in the installed copy so the plugin can find the binary
-	// in headless/systemd environments where PATH may not include user tool dirs.
-	// The installed file gets a baked-in absolute path while still honoring
-	// process.env.ENGRAM_BIN (explicit user override) and Bun.which("engram")
-	// (runtime PATH lookup when PATH is available). The source plugin file is
-	// not modified — it keeps the simple env-var form for development flexibility.
-	data = patchEngramBINLine(data, resolveEngramCommand())
-
 	dest := filepath.Join(dir, "engram.ts")
 	if err := openCodeWriteFileFn(dest, data, 0644); err != nil {
 		return nil, fmt.Errorf("write %s: %w", dest, err)
@@ -550,10 +497,9 @@ func installOpenCode() (*Result, error) {
 	files := 1
 	if err := injectOpenCodeMCPFn(); err != nil {
 		// Non-fatal: plugin works, MCP just needs manual config
-		cmd := resolveEngramCommand()
 		fmt.Fprintf(os.Stderr, "warning: could not auto-register MCP server in opencode.json: %v\n", err)
 		fmt.Fprintf(os.Stderr, "  Add manually to your opencode.json under \"mcp\":\n")
-		fmt.Fprintf(os.Stderr, "  \"engram\": { \"type\": \"local\", \"command\": [%q, \"mcp\", \"--tools=agent\"], \"enabled\": true }\n", cmd)
+		fmt.Fprintf(os.Stderr, "  \"engram\": { \"type\": \"remote\", \"url\": %q, \"enabled\": true }\n", engramRemoteMCPURL)
 	} else {
 		files++
 	}
@@ -664,12 +610,10 @@ func injectOpenCodeMCP() error {
 		return nil // already registered, nothing to do
 	}
 
-	// Add engram MCP entry (agent profile — only tools agents need).
-	// Use resolveEngramCommand() so Windows users (and headless Linux setups
-	// where PATH is not inherited) get the absolute binary path.
+	// Add the remote engram MCP entry (hosted server, no local binary).
 	engramEntry := map[string]interface{}{
-		"type":    "local",
-		"command": []string{resolveEngramCommand(), "mcp", "--tools=agent"},
+		"type":    "remote",
+		"url":     engramRemoteMCPURL,
 		"enabled": true,
 	}
 	entryJSON, err := jsonMarshalFn(engramEntry)
@@ -852,18 +796,9 @@ func claudeCodeUserMCPPath() string {
 // Using os.Executable() instead of PATH lookup ensures the correct binary is
 // referenced even when PATH is not propagated to MCP subprocesses (Windows).
 func writeClaudeCodeUserMCP() error {
-	exe, err := osExecutable()
-	if err != nil {
-		return fmt.Errorf("resolve binary path: %w", err)
-	}
-	// Resolve any symlinks so the path is stable across package manager updates.
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
-	}
-
 	entry := map[string]any{
-		"command": exe,
-		"args":    []string{"mcp", "--tools=agent"},
+		"type": "http",
+		"url":  engramRemoteMCPURL,
 	}
 	data, err := jsonMarshalIndentFn(entry, "", "  ")
 	if err != nil {
@@ -1029,8 +964,7 @@ func injectGeminiMCP(configPath string) error {
 	}
 
 	engramEntry := map[string]any{
-		"command": resolveEngramCommand(),
-		"args":    []string{"mcp", "--tools=agent"},
+		"httpUrl": engramRemoteMCPURL,
 	}
 	entryJSON, err := jsonMarshalFn(engramEntry)
 	if err != nil {
@@ -1054,32 +988,6 @@ func injectGeminiMCP(configPath string) error {
 	}
 
 	return nil
-}
-
-// resolveEngramCommand returns the most stable command to spawn the engram
-// binary. It uses os.Executable() so that headless/systemd environments (where
-// PATH is not reliably inherited by child processes) still find the binary.
-//
-// Homebrew (and Linuxbrew) resolve the `engram` symlink to a versioned Cellar
-// path such as /opt/homebrew/Cellar/engram/1.16.1/bin/engram. That path is
-// removed on the next `brew upgrade`, so baking it into MCP client configs
-// leaves a stale command that fails to spawn (ENOENT). When the resolved
-// executable points into a versioned Cellar directory we prefer the stable
-// <brew-prefix>/bin/engram symlink, which brew repoints at the current version,
-// so registrations survive upgrades. Falls back to bare "engram" only when
-// os.Executable() fails or the stable symlink is missing.
-func resolveEngramCommand() string {
-	exe, err := osExecutable()
-	if err != nil {
-		return "engram" // fallback to PATH-based name
-	}
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
-	}
-	if stable, ok := stableHomebrewEngramCommand(exe); ok {
-		return stable
-	}
-	return exe
 }
 
 // stableHomebrewEngramCommand maps a versioned Homebrew Cellar path to the
