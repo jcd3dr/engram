@@ -23,9 +23,15 @@
 
 > **DadeCore fork notice**
 >
-> This repository is DadeCore's maintained fork of [Gentleman-Programming/engram](https://github.com/Gentleman-Programming/engram), the original upstream project. It is not a temporary mirror — `jcd3dr/engram` is the DadeCore-owned codebase going forward, extended with a network-accessible Remote MCP transport (Streamable HTTP) and DadeCore's private-MCP authentication standard so Engram's persistent memory can be used as a Remote MCP connector from Claude and ChatGPT, deployed via Coolify.
+> This repository is DadeCore's maintained fork of [Gentleman-Programming/engram](https://github.com/Gentleman-Programming/engram). It is the DadeCore-owned codebase going forward. Upstream is kept as the `upstream-origin` git remote.
 >
-> All credit for the original design and implementation goes to [Gentleman-Programming](https://github.com/Gentleman-Programming) and its contributors. DadeCore-specific changes are additive: the existing stdio MCP transport, tool behavior, and SQLite/FTS5 memory core are preserved unmodified.
+> The fork adds one thing: a second MCP transport, **Streamable HTTP**, started with `engram mcp --transport=http`. It serves the same MCP server object as stdio, behind a single-owner OAuth 2.1 authorization server. This lets Engram be used as a remote MCP connector from cloud clients. The fork is deployed on Coolify at https://engram-mcp.jcdcruz.com.
+>
+> The stdio transport (`engram mcp`, the default), the tool behavior, and the SQLite/FTS5 memory core are unchanged from upstream.
+>
+> Fork documentation: [docs/REMOTE-MCP.md](docs/REMOTE-MCP.md) (endpoints and environment variables), [docs/COOLIFY.md](docs/COOLIFY.md) (deployment), [docs/PRODUCTION.md](docs/PRODUCTION.md) (operations), [docs/adr/0000-baseline.md](docs/adr/0000-baseline.md) (reconciled baseline and known gaps).
+>
+> All credit for the original design and implementation goes to [Gentleman-Programming](https://github.com/Gentleman-Programming) and its contributors.
 
 
 > **engram** `/ˈen.ɡræm/` — _neuroscience_: the physical trace of a memory in the brain.
@@ -106,12 +112,12 @@ It gives Pi persistent project memory, compaction recovery, and shared memory wi
 
 **Can Docker agents (or remote agents) connect to Engram's MCP?**
 
-Engram's MCP transport is **stdio only** — there is no HTTP or network MCP endpoint. `engram mcp` speaks the MCP protocol over stdin/stdout; it cannot be reached over a TCP port.
+There are two MCP transports:
 
-If you have agents running in Docker that need to write to Engram on the host, the available paths are:
+- **stdio** (default, `engram mcp`): the agent launches `engram mcp` as a subprocess and speaks MCP over stdin/stdout. This is the transport every local agent uses.
+- **Streamable HTTP** (fork addition, `engram mcp --transport=http`): serves the same MCP server at `/mcp` over HTTP(S), protected by the owner-key OAuth gate or `MCP_BEARER_TOKEN`. Use this for remote connectors (claude.ai, ChatGPT). Required environment variables and endpoints: [docs/REMOTE-MCP.md](docs/REMOTE-MCP.md). Deployment: [docs/COOLIFY.md](docs/COOLIFY.md).
 
-- **HTTP REST API** (`engram serve`): note that `engram serve` currently binds to `127.0.0.1` only, so it is **not** reachable from inside a container out of the box — a container cannot reach the host's loopback, and there is no bind-address flag yet. `ENGRAM_URL` lets the **Pi plugin** target an `engram serve` reachable on a routable host/port (e.g. `ENGRAM_URL=http://host.docker.internal:7437 pi`), but that only works once the server listens on a non-loopback interface, which is not supported today. The HTTP API is not the MCP protocol; Pi uses it for session capture and Pi-native `mem_*` tools. For Docker right now, prefer the stdio path below.
-- **Stdio MCP** (mount the binary): the cleanest path for a Dockerized agent that needs MCP tools is to mount the `engram` binary into the container and let the agent launch `engram mcp` locally via stdio, pointing `ENGRAM_DATA_DIR` at a volume shared with the host.
+For an agent running in Docker on the same machine, the stdio path still works: mount the `engram` binary into the container and let the agent launch `engram mcp` there, with `ENGRAM_DATA_DIR` pointing at a volume. The local HTTP API (`engram serve`) binds to `127.0.0.1` only and is not reachable from a container today.
 
 Full environment variable reference → [DOCS.md#environment-variables](DOCS.md#environment-variables)
 
@@ -139,7 +145,7 @@ Full details on session lifecycle, topic keys, and memory hygiene → [docs/ARCH
 
 With `any`, a memory can match one or more query tokens instead of requiring all of them. This is useful when you remember related keywords but not the exact wording stored in Engram.
 
-## MCP Tools (20)
+## MCP Tools (22)
 
 | Category               | Tools                                                                                                            |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -147,8 +153,11 @@ With `any`, a memory can match one or more query tokens instead of requiring all
 | **Search & Retrieve**  | `mem_search`, `mem_context`, `mem_timeline`, `mem_get_observation`                                               |
 | **Session Lifecycle**  | `mem_session_start`, `mem_session_end`, `mem_session_summary`                                                    |
 | **Conflict Surfacing** | `mem_judge`, `mem_compare`                                                                                       |
-| **Lifecycle Review**   | `mem_review`                                                                                                      |
+| **Lifecycle Review**   | `mem_review`                                                                                                     |
+| **Pinning**            | `mem_pin`, `mem_unpin`                                                                                           |
 | **Utilities**          | `mem_save_prompt`, `mem_stats`, `mem_capture_passive`, `mem_merge_projects`, `mem_current_project`, `mem_doctor` |
+
+The same 22 tools are served over stdio and over the fork's Streamable HTTP transport.
 
 Full tool reference with parameters → [DOCS.md#mcp-tools-20-tools](DOCS.md#mcp-tools-20-tools)
 
@@ -365,6 +374,7 @@ Your production engram is fully untouched throughout.
 | `engram setup [agent]`                     | Install agent integration                                       |
 | `engram serve [port]`                      | Start HTTP API (default: 7437)                                  |
 | `engram mcp [--tools=PROFILE] [--project NAME]` | Start MCP server (stdio transport)                         |
+| `engram mcp --transport=http`              | Start MCP server over Streamable HTTP (fork addition; see docs/REMOTE-MCP.md) |
 | `engram tui`                               | Launch terminal UI                                              |
 | `engram search <query>`                    | Search memories                                                 |
 | `engram save <title> <msg>`                | Save a memory                                                   |
@@ -400,6 +410,8 @@ Full CLI with all flags → [docs/ARCHITECTURE.md#cli-reference](docs/ARCHITECTU
 | `ENGRAM_CLOUD_ALLOWED_PROJECTS` | Comma-separated project allowlist for `engram cloud serve`. Use `*` to allow all projects.                             | (unset)        |
 | `ENGRAM_CLOUD_TOKEN_PEPPER`     | Dedicated secret used to hash managed tokens. Required to issue tokens via `engram cloud bootstrap admin --issue-token` AND to enable managed-token authentication on `engram cloud serve`; must differ from `ENGRAM_JWT_SECRET`. Without it, `engram cloud serve` still starts and authenticates via legacy `ENGRAM_CLOUD_TOKEN`/`ENGRAM_CLOUD_ADMIN` only. | (unset)        |
 
+Remote MCP variables (`ENGRAM_OWNER_KEY`, `ENCRYPTION_KEY`, `ENGRAM_PUBLIC_URL`, `MCP_BEARER_TOKEN`, `ENGRAM_PROJECT`, `ENGRAM_HTTP_ADDR`) are documented in [docs/REMOTE-MCP.md](docs/REMOTE-MCP.md).
+
 Full environment variable reference → [DOCS.md#environment-variables](DOCS.md#environment-variables)
 
 ## Documentation
@@ -415,6 +427,8 @@ Full environment variable reference → [DOCS.md#environment-variables](DOCS.md#
 | [Comparison](docs/COMPARISON.md)              | Why Engram vs claude-mem                                               |
 | [Intended Usage](docs/intended-usage.md)      | Mental model — how Engram is meant to be used                          |
 | [Obsidian Brain](docs/beta/obsidian-brain.md) | Export memories as Obsidian knowledge graph (beta)                     |
+| [Remote MCP](docs/REMOTE-MCP.md)              | Fork addition: Streamable HTTP transport, auth, endpoints              |
+| [Production](docs/PRODUCTION.md)              | Fork addition: deployment, backup, rollback, known findings            |
 | [Contributing](CONTRIBUTING.md)               | Contribution workflow + standards                                      |
 | [Full Docs](DOCS.md)                          | Complete technical reference                                           |
 

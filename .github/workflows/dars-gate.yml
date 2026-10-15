@@ -1,0 +1,93 @@
+name: dars-gate
+
+on:
+  pull_request:
+
+jobs:
+  dars-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Required DARS baseline exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            AGENTS.md
+            CLAUDE.md
+            GEMINI.md
+            CHANGELOG.md
+            docs/GOVERNANCE_SUMMARY.md
+            docs/SPEC.md
+            docs/REPO_MAP.md
+            docs/PLAN.md
+            docs/CONVENTIONS.md
+          )
+
+          for path in "${required[@]}"; do
+            if [ ! -f "$path" ]; then
+              echo "::error::Required DARS baseline surface is missing: $path"
+              exit 1
+            fi
+          done
+
+      - name: DARS version markers are present and aligned
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          versioned=(
+            AGENTS.md
+            CHANGELOG.md
+            docs/GOVERNANCE_SUMMARY.md
+            docs/SPEC.md
+            docs/REPO_MAP.md
+            docs/PLAN.md
+            docs/CONVENTIONS.md
+          )
+
+          extract_major_minor() {
+            local path="$1"
+            grep -Eo 'DARS( Standard)? v[0-9]+\.[0-9]+(\.[0-9]+)?' "$path" \
+              | head -n1 \
+              | sed -E 's/.*v([0-9]+\.[0-9]+)(\.[0-9]+)?/\1/'
+          }
+
+          reference="$(extract_major_minor AGENTS.md || true)"
+          if [ -z "$reference" ]; then
+            echo "::error::AGENTS.md is missing a DARS version marker."
+            exit 1
+          fi
+
+          for path in "${versioned[@]}"; do
+            version="$(extract_major_minor "$path" || true)"
+            if [ -z "$version" ]; then
+              echo "::error::$path is missing a DARS version marker."
+              exit 1
+            fi
+            if [ "$version" != "$reference" ]; then
+              echo "::error::DARS version drift: $path declares v$version while AGENTS.md declares v$reference."
+              exit 1
+            fi
+          done
+
+          if [ -f docs/adr/0000-baseline.md ]; then
+            baseline_version="$(extract_major_minor docs/adr/0000-baseline.md || true)"
+            if [ -z "$baseline_version" ]; then
+              echo "::error::docs/adr/0000-baseline.md exists but is missing a DARS version marker."
+              exit 1
+            fi
+            if [ "$baseline_version" != "$reference" ]; then
+              echo "::error::DARS version drift: docs/adr/0000-baseline.md declares v$baseline_version while AGENTS.md declares v$reference."
+              exit 1
+            fi
+          fi
+
+      - name: DARS gate boundary
+        shell: bash
+        run: |
+          echo 'DARS gate checks objective repository invariants only.'
+          echo 'It does not decide whether a change semantically required SPEC, PLAN, REPO_MAP, ADR, CONVENTIONS, evidence, AGENTS, or CHANGELOG maintenance.'
+          echo 'Durable-impact decisions remain repository-aware human/agent judgments governed by DARS.'
