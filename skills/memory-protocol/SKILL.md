@@ -1,57 +1,33 @@
 ---
 name: engram-memory-protocol
-description: >
-  Persistent memory discipline for Engram contributors.
-  Trigger: Decisions, bugfixes, discoveries, preferences, or session closure.
+description: "Persistent memory protocol for the remote Engram MCP shared by all DadeCore projects. Trigger: decisions, bug fixes, discoveries, preferences, session closure, compaction."
 license: Apache-2.0
 metadata:
-  author: gentleman-programming
-  version: "1.0"
+  author: dadecore
+  version: "2.0"
 ---
 
-## When to Use
+# Engram Persistent Memory — Protocol (remote)
 
-Use this skill when:
-- Making architecture or implementation decisions
-- Fixing bugs with non-obvious root causes
-- Discovering patterns, gotchas, or user preferences
-- Closing a session or after compaction
+Engram is a remote MCP server (connector "engram") that stores memory for many projects. It is shared by every client: Claude Code, claude.ai, ChatGPT.
 
----
+## Project rule (mandatory)
 
-## Save Rules
+Pass the `project` argument explicitly on EVERY mem_* call. The server has no default project. Use the name of the repository or project the work belongs to, in lowercase. Never omit it and never reuse the project of a different task.
 
-Call `mem_save` immediately after:
-- decision
-- bugfix
-- pattern/discovery
-- config/preference changes
+Tools that take `project`: mem_save, mem_search, mem_context, mem_session_summary, mem_save_prompt, mem_timeline, mem_stats, mem_review, mem_doctor.
 
-Use structured content:
-- What
-- Why
-- Where
-- Learned
+## Save (proactive)
 
-Use stable `topic_key` for evolving topics.
+Call mem_save right after: a decision or convention, a bug fix (include the root cause), a non-obvious discovery or gotcha, a configuration change, or a user preference. Use the structured format: What, Why, Where, Learned. Reuse a stable topic_key for topics that evolve, so the entry is updated instead of duplicated.
 
----
+## Search (before answering)
 
-## Search Rules
+- Recall requests: mem_context first, then mem_search.
+- On the first message that mentions the project, a feature, or a past problem: mem_search with those keywords, before responding.
+- For full content of a result: mem_get_observation.
 
-- On recall requests: `mem_context` first, then `mem_search`.
-- Before similar work: run proactive `mem_search`.
-- On first message: if user references the project, a feature, or a problem, call `mem_search` with their keywords before responding.
+## Close and compaction
 
----
-
-## Session Close Rules
-
-Before saying done/listo:
-1. Call `mem_session_summary`.
-2. Include goal, discoveries, accomplished, next steps, relevant files.
-
-After compaction:
-1. Save summary first.
-2. Recover context.
-3. Continue work.
+- Before saying the work is done: mem_session_summary with Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
+- After compaction: mem_session_summary with the compacted summary, then mem_context, then continue.

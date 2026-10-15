@@ -141,7 +141,7 @@ func cmdMCPHTTP(cfg store.Config) {
 	}
 
 	if projectOverride == "" {
-		log.Printf("[engram-remote-mcp] WARNING: no --project/ENGRAM_PROJECT set; remote tool calls resolve project via the same cwd/.engram/config.json/git heuristics as stdio mode, which has no meaningful cwd for a long-running server process. Set ENGRAM_PROJECT to pin a deterministic project (e.g. dadecore-standards).")
+		log.Printf("[engram-remote-mcp] no default project: every mem_* call must pass the project argument explicitly (multi-project server)")
 	}
 
 	sigCh := make(chan os.Signal, 1)
