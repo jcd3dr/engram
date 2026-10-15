@@ -5,18 +5,19 @@ import { dirname, join } from "node:path";
 
 const PACKAGE_NAME = "npm:gentle-engram@0.1.8";
 const MCP_ADAPTER_PACKAGE = "npm:pi-mcp-adapter";
+const ENGRAM_MCP_URL = process.env.ENGRAM_MCP_URL?.trim() || "https://engram-mcp.jcdcruz.com/mcp";
 const HELP = `pi-engram
 
 Usage:
   pi-engram init [--force]
 
-Creates Pi's Engram MCP config in the Pi agent dir and ensures pi-mcp-adapter
-is declared in settings.json. The Pi extension itself is loaded by installing
-the package with: pi install npm:gentle-engram@0.1.8
-`;
+Writes Pi's Engram MCP entry (the hosted Engram server) into the Pi agent dir and
+ensures pi-mcp-adapter is declared in settings.json. The Pi extension itself is
+loaded by installing the package with: pi install npm:gentle-engram@0.1.8
 
-const MCP_LAUNCHER =
-  "const { spawn } = require('node:child_process'); const bin = process.env.ENGRAM_BIN || 'engram'; const child = spawn(bin, ['mcp', '--tools=agent'], { stdio: 'inherit' }); child.on('error', () => process.exit(127)); child.on('exit', (code, signal) => { if (typeof code === 'number') process.exit(code); process.kill(process.pid, signal || 'SIGTERM'); });";
+Environment:
+  ENGRAM_MCP_URL  Engram MCP endpoint to write (default: https://engram-mcp.jcdcruz.com/mcp)
+`;
 
 function getAgentDir() {
   return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -49,11 +50,16 @@ function ensurePackage(settingsPath, packageName) {
 
 function createEngramServerConfig() {
   return {
-    command: "node",
-    args: ["-e", MCP_LAUNCHER],
+    url: ENGRAM_MCP_URL,
     lifecycle: "lazy",
     directTools: false,
   };
+}
+
+// Entries written by earlier versions launch a local `engram mcp` process (they carry
+// `command`). They are replaced automatically so Pi does not keep a local binary path.
+function isLegacyLocalEntry(entry) {
+  return Boolean(entry) && typeof entry === "object" && "command" in entry;
 }
 
 function ensureMcpConfig(mcpPath, force) {
@@ -61,9 +67,10 @@ function ensureMcpConfig(mcpPath, force) {
   const existingServers = config.mcpServers && typeof config.mcpServers === "object" && !Array.isArray(config.mcpServers)
     ? config.mcpServers
     : {};
+  const existing = existingServers.engram;
 
-  if (existingServers.engram && !force) {
-    return false;
+  if (existing && !force && !isLegacyLocalEntry(existing)) {
+    return "kept";
   }
 
   config.mcpServers = {
@@ -71,7 +78,7 @@ function ensureMcpConfig(mcpPath, force) {
     engram: createEngramServerConfig(),
   };
   writeJsonObject(mcpPath, config);
-  return true;
+  return isLegacyLocalEntry(existing) ? "replaced-legacy" : "written";
 }
 
 function init() {
@@ -82,13 +89,20 @@ function init() {
 
   const adapterChanged = ensurePackage(settingsPath, MCP_ADAPTER_PACKAGE);
   const packageChanged = ensurePackage(settingsPath, PACKAGE_NAME);
-  const mcpChanged = ensureMcpConfig(mcpPath, force);
+  const mcpResult = ensureMcpConfig(mcpPath, force);
 
   console.log(`Pi agent dir: ${agentDir}`);
   console.log(`${adapterChanged ? "Added" : "Kept"} ${MCP_ADAPTER_PACKAGE} in settings.json`);
   console.log(`${packageChanged ? "Added" : "Kept"} ${PACKAGE_NAME} in settings.json`);
-  console.log(`${mcpChanged ? "Wrote" : "Kept existing"} Engram MCP server in mcp.json`);
-  console.log("Set ENGRAM_URL for an existing engram serve instance, or ENGRAM_BIN for a custom engram binary path.");
+  const mcpMessage = {
+    written: "Wrote",
+    "replaced-legacy": "Replaced legacy local entry with",
+    kept: "Kept existing",
+  }[mcpResult];
+  console.log(`${mcpMessage} Engram MCP server (${ENGRAM_MCP_URL}) in mcp.json`);
+  if (mcpResult === "kept") {
+    console.log("Run pi-engram init --force to rewrite the entry (for example after changing ENGRAM_MCP_URL).");
+  }
 }
 
 const command = process.argv[2];

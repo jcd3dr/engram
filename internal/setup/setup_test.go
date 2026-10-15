@@ -138,20 +138,11 @@ func TestInstallGeminiCLIInjectsMCPConfig(t *testing.T) {
 		t.Fatalf("expected mcpServers.engram object")
 	}
 
-	// Since resolveEngramCommand() uses os.Executable() on all platforms, the
-	// command will be the real test binary path in integration tests (not bare
-	// "engram"). Verify it is a non-empty absolute path.
-	cmd, ok := engram["command"].(string)
-	if !ok || cmd == "" {
-		t.Fatalf("expected non-empty command string, got %#v", engram["command"])
+	if engram["httpUrl"] != engramRemoteMCPURL {
+		t.Fatalf("expected httpUrl %q, got %#v", engramRemoteMCPURL, engram["httpUrl"])
 	}
-	if cmd == "engram" {
-		t.Fatalf("expected absolute path from os.Executable(), got bare 'engram'")
-	}
-
-	args, ok := engram["args"].([]any)
-	if !ok || len(args) != 2 || args[0] != "mcp" || args[1] != "--tools=agent" {
-		t.Fatalf("expected args [mcp --tools=agent], got %#v", engram["args"])
+	if _, hasCommand := engram["command"]; hasCommand {
+		t.Fatalf("remote Gemini entry must not carry a local command")
 	}
 
 	if _, ok := mcpServers["other"]; !ok {
@@ -189,6 +180,7 @@ func TestInstallCodexInjectsTOMLAndIsIdempotent(t *testing.T) {
 	resetSetupSeams(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	lookPathFn = func(string) (string, error) { return "", errors.New("codex not installed") }
 
 	configPath := filepath.Join(home, ".codex", "config.toml")
 	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
@@ -241,13 +233,12 @@ func TestInstallCodexInjectsTOMLAndIsIdempotent(t *testing.T) {
 		if strings.Count(text, "[mcp_servers.engram]") != 1 {
 			t.Fatalf("expected exactly one engram section, got:\n%s", text)
 		}
-		// resolveEngramCommand() uses os.Executable() on all platforms — command
-		// will be the real absolute path in tests, not bare "engram".
-		if !strings.Contains(text, "command = ") || !strings.Contains(text, "engram") {
-			t.Fatalf("expected engram command in config, got:\n%s", text)
+		// The Codex entry is a remote url, never a local command.
+		if !strings.Contains(text, `url = "`+engramRemoteMCPURL+`"`) {
+			t.Fatalf("expected engram remote url in config, got:\n%s", text)
 		}
-		if !strings.Contains(text, `args = ["mcp", "--tools=agent"]`) {
-			t.Fatalf("expected engram args in config, got:\n%s", text)
+		if section := codexEngramSection(text); strings.Contains(section, "command = ") {
+			t.Fatalf("remote Codex entry must not carry a local command, got:\n%s", text)
 		}
 		instructionsPath := filepath.Join(home, ".codex", "engram-instructions.md")
 		if !strings.Contains(text, "model_instructions_file = \""+instructionsPath+"\"") {
@@ -480,10 +471,10 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	}
 	var mcpConfig struct {
 		MCPServers map[string]struct {
-			Command     string   `json:"command"`
-			Args        []string `json:"args"`
-			Lifecycle   string   `json:"lifecycle"`
-			DirectTools bool     `json:"directTools"`
+			URL string `json:"url"`
+
+			Lifecycle   string `json:"lifecycle"`
+			DirectTools bool   `json:"directTools"`
 		} `json:"mcpServers"`
 	}
 	if err := json.Unmarshal(mcpRaw, &mcpConfig); err != nil {
@@ -493,7 +484,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected mcpServers.engram in %#v", mcpConfig.MCPServers)
 	}
-	if server.Command != "/opt/engram/bin/engram" || !reflect.DeepEqual(server.Args, []string{"mcp", "--tools=agent"}) || server.Lifecycle != "lazy" || server.DirectTools {
+	if server.URL != engramRemoteMCPURL || server.Lifecycle != "lazy" || server.DirectTools {
 		t.Fatalf("unexpected engram MCP server: %#v", server)
 	}
 }
@@ -1324,12 +1315,11 @@ func TestWriteClaudeCodeUserMCP(t *testing.T) {
 			t.Fatalf("parse mcp config: %v", err)
 		}
 
-		if cfg["command"] != "/usr/local/bin/engram" {
-			t.Fatalf("expected absolute path command, got %#v", cfg["command"])
+		if cfg["url"] != engramRemoteMCPURL || cfg["type"] != "http" {
+			t.Fatalf("expected remote http entry, got %#v", cfg)
 		}
-		args, ok := cfg["args"].([]any)
-		if !ok || len(args) != 2 || args[0] != "mcp" || args[1] != "--tools=agent" {
-			t.Fatalf("expected args [mcp --tools=agent], got %#v", cfg["args"])
+		if _, hasCommand := cfg["command"]; hasCommand {
+			t.Fatalf("remote Claude Code entry must not carry a local command")
 		}
 	})
 
@@ -1358,19 +1348,8 @@ func TestWriteClaudeCodeUserMCP(t *testing.T) {
 		if err := json.Unmarshal(raw, &cfg); err != nil {
 			t.Fatalf("parse config: %v", err)
 		}
-		if cfg["command"] != "/new/path/engram" {
-			t.Fatalf("expected updated command, got %#v", cfg["command"])
-		}
-	})
-
-	t.Run("os.Executable failure returns error", func(t *testing.T) {
-		resetSetupSeams(t)
-		useTestHome(t)
-		osExecutable = func() (string, error) { return "", errors.New("exec not found") }
-
-		err := writeClaudeCodeUserMCP()
-		if err == nil || !strings.Contains(err.Error(), "resolve binary path") {
-			t.Fatalf("expected resolve binary path error, got %v", err)
+		if cfg["url"] != engramRemoteMCPURL {
+			t.Fatalf("expected remote url, got %#v", cfg["url"])
 		}
 	})
 
@@ -1424,134 +1403,6 @@ func TestWriteClaudeCodeUserMCP(t *testing.T) {
 	})
 }
 
-func TestResolveEngramCommand(t *testing.T) {
-	t.Run("unix returns absolute path from os.Executable", func(t *testing.T) {
-		resetSetupSeams(t)
-		runtimeGOOS = "linux"
-		osExecutable = func() (string, error) { return "/usr/local/bin/engram", nil }
-
-		got := resolveEngramCommand()
-		// EvalSymlinks on a non-existent path returns an error, so the result
-		// is the raw os.Executable() value.
-		if got == "engram" {
-			t.Fatalf("expected absolute path on unix, got bare 'engram'")
-		}
-		if !strings.Contains(got, "engram") {
-			t.Fatalf("expected engram in path, got %q", got)
-		}
-	})
-
-	t.Run("darwin returns absolute path from os.Executable", func(t *testing.T) {
-		resetSetupSeams(t)
-		runtimeGOOS = "darwin"
-		osExecutable = func() (string, error) { return "/opt/homebrew/bin/engram", nil }
-
-		got := resolveEngramCommand()
-		if got == "engram" {
-			t.Fatalf("expected absolute path on darwin, got bare 'engram'")
-		}
-		if !strings.Contains(got, "engram") {
-			t.Fatalf("expected engram in path, got %q", got)
-		}
-	})
-
-	t.Run("windows returns absolute path", func(t *testing.T) {
-		resetSetupSeams(t)
-		runtimeGOOS = "windows"
-		osExecutable = func() (string, error) { return `C:\Users\user\bin\engram.exe`, nil }
-
-		got := resolveEngramCommand()
-		// EvalSymlinks may change the path on real OS but in tests it should
-		// either equal the input or the resolved form — either way not bare "engram"
-		if got == "engram" {
-			t.Fatalf("expected absolute path on windows, got bare 'engram'")
-		}
-		if !strings.Contains(got, "engram") {
-			t.Fatalf("expected engram in path, got %q", got)
-		}
-	})
-
-	t.Run("executable error falls back to bare name on all platforms", func(t *testing.T) {
-		for _, goos := range []string{"linux", "darwin", "windows"} {
-			t.Run(goos, func(t *testing.T) {
-				resetSetupSeams(t)
-				runtimeGOOS = goos
-				osExecutable = func() (string, error) { return "", errors.New("no executable") }
-
-				if got := resolveEngramCommand(); got != "engram" {
-					t.Fatalf("expected fallback to bare 'engram', got %q", got)
-				}
-			})
-		}
-	})
-}
-
-// TestResolveEngramCommandHomebrewCellar guards against baking a versioned
-// Homebrew/Linuxbrew Cellar path into MCP client configs. Such paths (e.g.
-// .../Cellar/engram/1.16.1/bin/engram) are removed on `brew upgrade`, leaving
-// OpenCode/Codex with a stale command that fails to spawn (ENOENT). The command
-// must resolve to the stable <brew-prefix>/bin/engram symlink, or bare "engram"
-// when that symlink is missing.
-func TestResolveEngramCommandHomebrewCellar(t *testing.T) {
-	cases := []struct {
-		name         string
-		exe          string
-		stableOnDisk string // stable symlink present on disk; "" means none
-		want         string
-	}{
-		{
-			name:         "linuxbrew cellar maps to stable bin symlink",
-			exe:          "/home/linuxbrew/.linuxbrew/Cellar/engram/1.16.1/bin/engram",
-			stableOnDisk: "/home/linuxbrew/.linuxbrew/bin/engram",
-			want:         "/home/linuxbrew/.linuxbrew/bin/engram",
-		},
-		{
-			name:         "macos arm cellar maps to stable bin symlink",
-			exe:          "/opt/homebrew/Cellar/engram/1.16.1/bin/engram",
-			stableOnDisk: "/opt/homebrew/bin/engram",
-			want:         "/opt/homebrew/bin/engram",
-		},
-		{
-			name:         "macos intel cellar maps to stable bin symlink",
-			exe:          "/usr/local/Cellar/engram/1.16.1/bin/engram",
-			stableOnDisk: "/usr/local/bin/engram",
-			want:         "/usr/local/bin/engram",
-		},
-		{
-			name:         "cellar path with missing stable symlink falls back to bare name",
-			exe:          "/opt/homebrew/Cellar/engram/1.16.1/bin/engram",
-			stableOnDisk: "",
-			want:         "engram",
-		},
-		{
-			name:         "non-cellar absolute path is preserved",
-			exe:          "/opt/engram/bin/engram",
-			stableOnDisk: "",
-			want:         "/opt/engram/bin/engram",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			resetSetupSeams(t)
-			osExecutable = func() (string, error) { return tc.exe, nil }
-			statFn = func(name string) (os.FileInfo, error) {
-				if tc.stableOnDisk != "" && filepath.ToSlash(name) == tc.stableOnDisk {
-					return nil, nil // exists
-				}
-				return nil, os.ErrNotExist
-			}
-
-			// Normalize separators so the comparison holds on Windows runners,
-			// where resolveEngramCommand returns OS-native separators via
-			// filepath.FromSlash while tc.want is written with forward slashes.
-			if got := filepath.ToSlash(resolveEngramCommand()); got != tc.want {
-				t.Fatalf("resolveEngramCommand() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestClaudeCodeMCPDirPaths(t *testing.T) {
 	resetSetupSeams(t)
 	userHomeDir = func() (string, error) { return "/home/tester", nil }
@@ -1565,115 +1416,6 @@ func TestClaudeCodeMCPDirPaths(t *testing.T) {
 	if got := claudeCodeUserMCPPath(); got != expectedPath {
 		t.Fatalf("expected %s, got %s", expectedPath, got)
 	}
-}
-
-// TestGeminiInjectUsesAbsolutePath verifies that injectGeminiMCP writes the
-// absolute binary path from os.Executable() on all platforms (issue #113).
-func TestGeminiInjectUsesAbsolutePath(t *testing.T) {
-	for _, tc := range []struct {
-		goos string
-		exe  string
-	}{
-		{"windows", `C:\Users\user\bin\engram.exe`},
-		{"linux", "/usr/local/bin/engram"},
-		{"darwin", "/opt/homebrew/bin/engram"},
-	} {
-		t.Run(tc.goos+" uses absolute path", func(t *testing.T) {
-			resetSetupSeams(t)
-			runtimeGOOS = tc.goos
-			osExecutable = func() (string, error) { return tc.exe, nil }
-
-			configPath := filepath.Join(t.TempDir(), "settings.json")
-			if err := injectGeminiMCP(configPath); err != nil {
-				t.Fatalf("injectGeminiMCP failed: %v", err)
-			}
-
-			raw, err := os.ReadFile(configPath)
-			if err != nil {
-				t.Fatalf("read config: %v", err)
-			}
-			var cfg map[string]any
-			if err := json.Unmarshal(raw, &cfg); err != nil {
-				t.Fatalf("parse config: %v", err)
-			}
-			mcpServers := cfg["mcpServers"].(map[string]any)
-			engram := mcpServers["engram"].(map[string]any)
-			cmd := engram["command"].(string)
-			if cmd == "engram" {
-				t.Fatalf("expected absolute path on %s, got bare 'engram'", tc.goos)
-			}
-			if !strings.Contains(cmd, "engram") {
-				t.Fatalf("expected engram in command path, got %q", cmd)
-			}
-		})
-	}
-
-	t.Run("fallback to bare engram when os.Executable fails", func(t *testing.T) {
-		resetSetupSeams(t)
-		runtimeGOOS = "linux"
-		osExecutable = func() (string, error) { return "", errors.New("no executable") }
-
-		configPath := filepath.Join(t.TempDir(), "settings.json")
-		if err := injectGeminiMCP(configPath); err != nil {
-			t.Fatalf("injectGeminiMCP failed: %v", err)
-		}
-
-		raw, err := os.ReadFile(configPath)
-		if err != nil {
-			t.Fatalf("read config: %v", err)
-		}
-		var cfg map[string]any
-		if err := json.Unmarshal(raw, &cfg); err != nil {
-			t.Fatalf("parse config: %v", err)
-		}
-		mcpServers := cfg["mcpServers"].(map[string]any)
-		engram := mcpServers["engram"].(map[string]any)
-		if got := engram["command"]; got != "engram" {
-			t.Fatalf("expected bare 'engram' fallback, got %#v", got)
-		}
-	})
-}
-
-// TestCodexBlockUsesAbsolutePath verifies codexEngramBlockStr() always bakes
-// in the absolute binary path from os.Executable() (issue #113).
-func TestCodexBlockUsesAbsolutePath(t *testing.T) {
-	for _, tc := range []struct {
-		goos string
-		exe  string
-		want string
-	}{
-		{"windows", `C:\Users\user\bin\engram.exe`, `C:\Users\user\bin\engram.exe`},
-		{"linux", "/usr/local/bin/engram", "/usr/local/bin/engram"},
-		{"darwin", "/opt/homebrew/bin/engram", "/opt/homebrew/bin/engram"},
-	} {
-		t.Run(tc.goos+" uses absolute path in codex block", func(t *testing.T) {
-			resetSetupSeams(t)
-			runtimeGOOS = tc.goos
-			osExecutable = func() (string, error) { return tc.exe, nil }
-
-			block := codexEngramBlockStr()
-			if !strings.Contains(block, "[mcp_servers.engram]") {
-				t.Fatalf("expected mcp_servers.engram header, got:\n%s", block)
-			}
-			if !strings.Contains(block, `args = ["mcp", "--tools=agent"]`) {
-				t.Fatalf("expected args in codex block, got:\n%s", block)
-			}
-			if block == codexEngramBlock {
-				t.Fatalf("expected absolute path, got bare-engram fallback block:\n%s", block)
-			}
-		})
-	}
-
-	t.Run("falls back to bare engram when os.Executable fails", func(t *testing.T) {
-		resetSetupSeams(t)
-		runtimeGOOS = "linux"
-		osExecutable = func() (string, error) { return "", errors.New("no executable") }
-
-		block := codexEngramBlockStr()
-		if !strings.Contains(block, `command = "engram"`) {
-			t.Fatalf("expected bare engram fallback in codex block, got:\n%s", block)
-		}
-	})
 }
 
 func TestPathHelpersAcrossOSVariants(t *testing.T) {
@@ -1864,10 +1606,9 @@ func TestGeminiAndCodexHelpersErrorPaths(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected engram server object")
 		}
-		// resolveEngramCommand() now returns absolute path on all platforms.
-		cmd, ok := engram["command"].(string)
-		if !ok || !strings.Contains(cmd, "engram") {
-			t.Fatalf("expected command containing 'engram', got %#v", engram["command"])
+		// The Gemini entry is the remote httpUrl, never a local command.
+		if engram["httpUrl"] != engramRemoteMCPURL {
+			t.Fatalf("expected httpUrl %q, got %#v", engramRemoteMCPURL, engram["httpUrl"])
 		}
 	})
 
@@ -2903,399 +2644,104 @@ func TestInjectOpenCodeTUIPluginHandlesJSONC(t *testing.T) {
 
 // ─── Issue #112: OpenCode MCP absolute-path config ───────────────────────────
 
-// TestInjectOpenCodeMCPUsesResolvedCommand verifies that injectOpenCodeMCP()
-// writes the absolute binary path from os.Executable() on all platforms
-// (issue #113: headless environments where PATH may not include user tools).
-func TestInjectOpenCodeMCPUsesResolvedCommand(t *testing.T) {
-	for _, tc := range []struct {
-		goos string
-		exe  string
-	}{
-		{"windows", `C:\Users\user\bin\engram.exe`},
-		{"linux", "/usr/local/bin/engram"},
-		{"darwin", "/opt/homebrew/bin/engram"},
-	} {
-		t.Run(tc.goos+" writes absolute path in command array", func(t *testing.T) {
-			resetSetupSeams(t)
-			home := useTestHome(t)
-			runtimeGOOS = tc.goos
-			osExecutable = func() (string, error) { return tc.exe, nil }
-			t.Setenv("XDG_CONFIG_HOME", "")
-
-			configDir := filepath.Join(home, ".config", "opencode")
-			if err := os.MkdirAll(configDir, 0755); err != nil {
-				t.Fatalf("mkdir config dir: %v", err)
-			}
-
-			if err := injectOpenCodeMCP(); err != nil {
-				t.Fatalf("injectOpenCodeMCP failed: %v", err)
-			}
-
-			raw, err := os.ReadFile(filepath.Join(configDir, "opencode.json"))
-			if err != nil {
-				t.Fatalf("read config: %v", err)
-			}
-			var cfg map[string]any
-			if err := json.Unmarshal(raw, &cfg); err != nil {
-				t.Fatalf("parse config: %v", err)
-			}
-			mcp := cfg["mcp"].(map[string]any)
-			engram := mcp["engram"].(map[string]any)
-			cmd := engram["command"].([]any)
-			if len(cmd) == 0 {
-				t.Fatalf("expected non-empty command array")
-			}
-			first := cmd[0].(string)
-			if first == "engram" {
-				t.Fatalf("expected absolute path on %s, got bare 'engram'", tc.goos)
-			}
-			if !strings.Contains(first, "engram") {
-				t.Fatalf("expected engram in command path, got %q", first)
-			}
-			// Remaining args should be the MCP flags
-			if len(cmd) != 3 || cmd[1] != "mcp" || cmd[2] != "--tools=agent" {
-				t.Fatalf("expected args [<path> mcp --tools=agent], got %v", cmd)
-			}
-		})
-	}
-
-	t.Run("executable error falls back to bare engram on all platforms", func(t *testing.T) {
-		for _, goos := range []string{"linux", "darwin", "windows"} {
-			t.Run(goos, func(t *testing.T) {
-				resetSetupSeams(t)
-				home := useTestHome(t)
-				runtimeGOOS = goos
-				osExecutable = func() (string, error) { return "", errors.New("no executable") }
-				t.Setenv("XDG_CONFIG_HOME", "")
-
-				configDir := filepath.Join(home, ".config", "opencode")
-				if err := os.MkdirAll(configDir, 0755); err != nil {
-					t.Fatalf("mkdir config dir: %v", err)
-				}
-
-				if err := injectOpenCodeMCP(); err != nil {
-					t.Fatalf("injectOpenCodeMCP failed: %v", err)
-				}
-
-				raw, err := os.ReadFile(filepath.Join(configDir, "opencode.json"))
-				if err != nil {
-					t.Fatalf("read config: %v", err)
-				}
-				var cfg map[string]any
-				if err := json.Unmarshal(raw, &cfg); err != nil {
-					t.Fatalf("parse config: %v", err)
-				}
-				mcp := cfg["mcp"].(map[string]any)
-				engram := mcp["engram"].(map[string]any)
-				cmd := engram["command"].([]any)
-				if len(cmd) == 0 {
-					t.Fatalf("expected non-empty command array")
-				}
-				if got := cmd[0].(string); got != "engram" {
-					t.Fatalf("expected fallback to bare 'engram' when os.Executable fails, got %q", got)
-				}
-			})
-		}
-	})
-}
-
-// TestInstallOpenCodeWarningUsesResolvedCommand verifies that when MCP injection
-// fails, the warning message printed to stderr uses the resolved absolute command
-// path so the user's manual config snippet contains the correct binary path even
-// in headless/systemd environments (issue #113).
-func TestInstallOpenCodeWarningUsesResolvedCommand(t *testing.T) {
-	for _, tc := range []struct {
-		goos string
-		exe  string
-	}{
-		{"windows", `C:\bin\engram.exe`},
-		{"linux", "/nonexistent/bin/engram"},  // non-existent so EvalSymlinks is a no-op
-		{"darwin", "/nonexistent/bin/engram"}, // non-existent so EvalSymlinks is a no-op
-	} {
-		t.Run(tc.goos+" warning contains absolute path", func(t *testing.T) {
-			resetSetupSeams(t)
-			home := useTestHome(t)
-			runtimeGOOS = tc.goos
-			osExecutable = func() (string, error) { return tc.exe, nil }
-			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
-
-			// Force MCP injection to fail so the warning branch is exercised
-			injectOpenCodeMCPFn = func() error {
-				return errors.New("cannot write config")
-			}
-
-			// Capture stderr
-			origStderr := os.Stderr
-			r, w, err := os.Pipe()
-			if err != nil {
-				t.Fatalf("pipe: %v", err)
-			}
-			os.Stderr = w
-
-			_, installErr := installOpenCode()
-			w.Close()
-			os.Stderr = origStderr
-
-			if installErr != nil {
-				t.Fatalf("installOpenCode should not fail when MCP injection is non-fatal: %v", installErr)
-			}
-
-			buf := make([]byte, 4096)
-			n, _ := r.Read(buf)
-			stderr := string(buf[:n])
-
-			// Warning must reference the binary path — not just bare "engram"
-			if !strings.Contains(stderr, "engram") {
-				t.Fatalf("expected engram path in warning on %s, got:\n%s", tc.goos, stderr)
-			}
-			// Must NOT be the bare "engram" unquoted form (since we have an absolute path)
-			if strings.Contains(stderr, `["engram",`) {
-				t.Fatalf("expected absolute path (not bare engram) in warning message, got:\n%s", stderr)
-			}
-		})
-	}
-}
-
 // ─── Issue #113: OpenCode plugin ENGRAM_BIN bake-in ─────────────────────────
-
-// TestPatchEngramBINLine verifies that patchEngramBINLine() correctly rewrites
-// the ENGRAM_BIN constant in the plugin source to include a Bun.which() runtime
-// fallback and a baked-in absolute path as the final headless fallback.
-func TestPatchEngramBINLine(t *testing.T) {
-	const original = `const ENGRAM_BIN = process.env.ENGRAM_BIN ?? "engram"`
-
-	t.Run("bakes in absolute path with Bun.which intermediate fallback", func(t *testing.T) {
-		result := string(patchEngramBINLine([]byte(original), "/usr/local/bin/engram"))
-
-		if strings.Contains(result, `?? "engram"`) {
-			t.Fatalf("original bare-engram fallback should be replaced, got:\n%s", result)
-		}
-		if !strings.Contains(result, `process.env.ENGRAM_BIN`) {
-			t.Fatalf("must keep process.env.ENGRAM_BIN as first option, got:\n%s", result)
-		}
-		if !strings.Contains(result, `Bun.which("engram")`) {
-			t.Fatalf("must include Bun.which fallback, got:\n%s", result)
-		}
-		if !strings.Contains(result, `"/usr/local/bin/engram"`) {
-			t.Fatalf("must include baked-in absolute path, got:\n%s", result)
-		}
-		// Verify precedence order: env var ?? Bun.which ?? absolute path
-		envIdx := strings.Index(result, `process.env.ENGRAM_BIN`)
-		whichIdx := strings.Index(result, `Bun.which`)
-		absIdx := strings.Index(result, `"/usr/local/bin/engram"`)
-		if !(envIdx < whichIdx && whichIdx < absIdx) {
-			t.Fatalf("wrong precedence order (env < which < abs), got:\n%s", result)
-		}
-	})
-
-	t.Run("Windows path with backslashes is JSON-quoted correctly", func(t *testing.T) {
-		result := string(patchEngramBINLine([]byte(original), `C:\Users\user\bin\engram.exe`))
-
-		// The path must appear as a properly JSON-escaped string
-		if !strings.Contains(result, `Bun.which("engram")`) {
-			t.Fatalf("must include Bun.which fallback, got:\n%s", result)
-		}
-		if !strings.Contains(result, `engram.exe`) {
-			t.Fatalf("must include Windows binary name, got:\n%s", result)
-		}
-	})
-
-	t.Run("bare engram fallback when os.Executable failed", func(t *testing.T) {
-		result := string(patchEngramBINLine([]byte(original), "engram"))
-
-		// When absBin=="engram", we still add Bun.which but don't repeat "engram" as absolute
-		if !strings.Contains(result, `process.env.ENGRAM_BIN`) {
-			t.Fatalf("must keep process.env.ENGRAM_BIN, got:\n%s", result)
-		}
-		if !strings.Contains(result, `Bun.which("engram")`) {
-			t.Fatalf("must include Bun.which fallback, got:\n%s", result)
-		}
-	})
-
-	t.Run("does not modify source if marker is absent", func(t *testing.T) {
-		src := []byte(`// already patched\nconst ENGRAM_BIN = process.env.ENGRAM_BIN ?? Bun.which("engram") ?? "/bin/engram"`)
-		result := patchEngramBINLine(src, "/new/bin/engram")
-		// Marker not found — returns original unchanged
-		if string(result) != string(src) {
-			t.Fatalf("expected no-op when marker absent, got:\n%s", string(result))
-		}
-	})
-
-	t.Run("only replaces first occurrence", func(t *testing.T) {
-		doubled := original + "\n" + original
-		result := string(patchEngramBINLine([]byte(doubled), "/bin/engram"))
-		// One line should be replaced, the other should remain as-is
-		if strings.Count(result, `?? "engram"`) != 1 {
-			t.Fatalf("expected exactly one original line to remain, got:\n%s", result)
-		}
-	})
-}
-
-// TestInstallOpenCodeBakesENGRAMBIN verifies that installOpenCode() writes a
-// plugin file where ENGRAM_BIN includes the absolute binary path as a fallback,
-// so the plugin works in headless/systemd environments (issue #113).
-func TestInstallOpenCodeBakesENGRAMBIN(t *testing.T) {
-	t.Run("installed plugin contains absolute path fallback", func(t *testing.T) {
-		resetSetupSeams(t)
-		home := useTestHome(t)
-		runtimeGOOS = "linux"
-		osExecutable = func() (string, error) { return "/usr/local/bin/engram", nil }
-		t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
-
-		result, err := installOpenCode()
-		if err != nil {
-			t.Fatalf("installOpenCode failed: %v", err)
-		}
-		if result.Agent != "opencode" {
-			t.Fatalf("unexpected agent: %q", result.Agent)
-		}
-
-		pluginPath := filepath.Join(home, "xdg", "opencode", "plugins", "engram.ts")
-		raw, err := os.ReadFile(pluginPath)
-		if err != nil {
-			t.Fatalf("read installed plugin: %v", err)
-		}
-		content := string(raw)
-
-		// Must have env var override as first priority
-		if !strings.Contains(content, `process.env.ENGRAM_BIN`) {
-			t.Fatalf("installed plugin must keep process.env.ENGRAM_BIN override")
-		}
-		// Must have Bun.which intermediate fallback
-		if !strings.Contains(content, `Bun.which("engram")`) {
-			t.Fatalf("installed plugin must include Bun.which fallback")
-		}
-		// Must have the baked-in absolute path
-		if !strings.Contains(content, `"/usr/local/bin/engram"`) {
-			t.Fatalf("installed plugin must contain baked-in absolute path, got:\n%s", content)
-		}
-		// Source plugin file must remain unchanged (no patching of the template)
-		srcRaw, err := openCodeReadFile("plugins/opencode/engram.ts")
-		if err != nil {
-			t.Fatalf("read embedded plugin: %v", err)
-		}
-		if !strings.Contains(string(srcRaw), `?? "engram"`) {
-			t.Fatalf("source embedded plugin must remain unpatched")
-		}
-	})
-
-	t.Run("ENGRAM_BIN env var still takes precedence at runtime", func(t *testing.T) {
-		// We verify by inspection: the installed plugin must use ?? so that a
-		// truthy process.env.ENGRAM_BIN short-circuits before Bun.which and the
-		// baked-in path. This is the JavaScript ?? semantics guarantee.
-		resetSetupSeams(t)
-		home := useTestHome(t)
-		runtimeGOOS = "linux"
-		osExecutable = func() (string, error) { return "/usr/local/bin/engram", nil }
-		t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
-
-		if _, err := installOpenCode(); err != nil {
-			t.Fatalf("installOpenCode failed: %v", err)
-		}
-
-		pluginPath := filepath.Join(home, "xdg", "opencode", "plugins", "engram.ts")
-		raw, err := os.ReadFile(pluginPath)
-		if err != nil {
-			t.Fatalf("read installed plugin: %v", err)
-		}
-		content := string(raw)
-
-		// The line must have the form:
-		// const ENGRAM_BIN = process.env.ENGRAM_BIN ?? Bun.which("engram") ?? "/abs/path"
-		// where process.env.ENGRAM_BIN is leftmost (wins if set).
-		envIdx := strings.Index(content, `process.env.ENGRAM_BIN`)
-		whichIdx := strings.Index(content, `Bun.which("engram")`)
-		absIdx := strings.Index(content, `"/usr/local/bin/engram"`)
-		if envIdx == -1 || whichIdx == -1 || absIdx == -1 {
-			t.Fatalf("missing expected tokens in installed plugin:\n%s", content)
-		}
-		if !(envIdx < whichIdx && whichIdx < absIdx) {
-			t.Fatalf("wrong operator precedence in ENGRAM_BIN line:\n%s", content)
-		}
-	})
-
-	t.Run("os.Executable fallback: Bun.which added but no double-engram", func(t *testing.T) {
-		resetSetupSeams(t)
-		home := useTestHome(t)
-		runtimeGOOS = "linux"
-		osExecutable = func() (string, error) { return "", errors.New("no executable") }
-		t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
-
-		if _, err := installOpenCode(); err != nil {
-			t.Fatalf("installOpenCode failed: %v", err)
-		}
-
-		pluginPath := filepath.Join(home, "xdg", "opencode", "plugins", "engram.ts")
-		raw, err := os.ReadFile(pluginPath)
-		if err != nil {
-			t.Fatalf("read installed plugin: %v", err)
-		}
-		content := string(raw)
-
-		if !strings.Contains(content, `Bun.which("engram")`) {
-			t.Fatalf("must still add Bun.which even when os.Executable fails")
-		}
-	})
-}
 
 // ─── Issue #116: Sub-agent session inflation fix ─────────────────────────────
 
-// TestPluginSubAgentFiltering verifies that the installed plugin source
-// contains the necessary logic to:
-//
-//	a) read session data from event.properties.info (not event.properties)
-//	b) suppress Task() sub-agent sessions via parentID or title suffix check
-//	c) track sub-agent IDs in subAgentSessions for cross-hook suppression
-func TestPluginSubAgentFiltering(t *testing.T) {
+func TestGeminiInjectUsesRemoteURL(t *testing.T) {
+	resetSetupSeams(t)
+	configPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := injectGeminiMCP(configPath); err != nil {
+		t.Fatalf("injectGeminiMCP failed: %v", err)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var cfg struct {
+		MCPServers map[string]map[string]any `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	entry := cfg.MCPServers["engram"]
+	if entry["httpUrl"] != engramRemoteMCPURL {
+		t.Fatalf("expected httpUrl %q, got %#v", engramRemoteMCPURL, entry)
+	}
+	if _, hasCommand := entry["command"]; hasCommand {
+		t.Fatalf("remote Gemini entry must not carry a local command")
+	}
+}
+
+func TestCodexBlockUsesRemoteURL(t *testing.T) {
+	want := "[mcp_servers.engram]\nurl = \"" + engramRemoteMCPURL + "\""
+	if got := codexEngramBlockStr(); got != want {
+		t.Fatalf("codex block = %q, want %q", got, want)
+	}
+}
+
+func TestInjectOpenCodeMCPUsesRemoteURL(t *testing.T) {
 	resetSetupSeams(t)
 	home := useTestHome(t)
-	runtimeGOOS = "linux"
-	osExecutable = func() (string, error) { return "/usr/local/bin/engram", nil }
+	t.Setenv("XDG_CONFIG_HOME", "")
+	if err := os.MkdirAll(filepath.Join(home, ".config", "opencode"), 0755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := injectOpenCodeMCP(); err != nil {
+		t.Fatalf("injectOpenCodeMCP failed: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".config", "opencode", "opencode.json"))
+	if err != nil {
+		t.Fatalf("read opencode.json: %v", err)
+	}
+	var cfg struct {
+		MCP map[string]map[string]any `json:"mcp"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse opencode.json: %v", err)
+	}
+	entry := cfg.MCP["engram"]
+	if entry["type"] != "remote" || entry["url"] != engramRemoteMCPURL {
+		t.Fatalf("expected remote engram entry, got %#v", entry)
+	}
+	if _, hasCommand := entry["command"]; hasCommand {
+		t.Fatalf("remote entry must not carry a local command")
+	}
+}
+
+// codexEngramSection returns the [mcp_servers.engram] table from a Codex config,
+// so unrelated servers that legitimately use a command are not inspected.
+func codexEngramSection(text string) string {
+	start := strings.Index(text, "[mcp_servers.engram]")
+	if start == -1 {
+		return ""
+	}
+	section := text[start+1:]
+	if next := strings.Index(section, "\n["); next != -1 {
+		section = section[:next]
+	}
+	return section
+}
+
+func TestInstallOpenCodePluginIsRemoteOnly(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
 
 	if _, err := installOpenCode(); err != nil {
 		t.Fatalf("installOpenCode failed: %v", err)
 	}
-
-	pluginPath := filepath.Join(home, "xdg", "opencode", "plugins", "engram.ts")
-	raw, err := os.ReadFile(pluginPath)
+	raw, err := os.ReadFile(filepath.Join(home, "xdg", "opencode", "plugins", "engram.ts"))
 	if err != nil {
 		t.Fatalf("read installed plugin: %v", err)
 	}
 	content := string(raw)
-
-	// a) Session data must be read from event.properties.info
-	if !strings.Contains(content, `event.properties as any)?.info`) {
-		t.Fatalf("plugin must read session data from event.properties.info, got:\n%s", content)
+	for _, forbidden := range []string{"ENGRAM_BIN", "engram serve", "127.0.0.1", "ENGRAM_PORT"} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("installed OpenCode plugin must not reference a local engram (%q)", forbidden)
+		}
 	}
-
-	// b) parentID check: sub-agents with a parentID must not register sessions
-	if !strings.Contains(content, `parentID`) {
-		t.Fatalf("plugin must check parentID to detect sub-agent sessions")
-	}
-
-	// b) title suffix check: secondary signal for sub-agent detection
-	if !strings.Contains(content, `subagent)`) {
-		t.Fatalf("plugin must check title suffix ' subagent)' as secondary sub-agent signal")
-	}
-
-	// b) isSubAgent gate: must guard ensureSession() call
-	if !strings.Contains(content, `isSubAgent`) {
-		t.Fatalf("plugin must use isSubAgent flag to gate ensureSession()")
-	}
-
-	// c) subAgentSessions set must exist for cross-hook suppression
-	if !strings.Contains(content, `subAgentSessions`) {
-		t.Fatalf("plugin must define subAgentSessions set for cross-hook suppression")
-	}
-
-	// Verify ensureSession itself guards against sub-agent sessions
-	if !strings.Contains(content, `subAgentSessions.has(sessionId)`) {
-		t.Fatalf("ensureSession must check subAgentSessions before registering")
-	}
-
-	// session.deleted must clean up subAgentSessions too
-	if !strings.Contains(content, `subAgentSessions.delete(sessionId)`) {
-		t.Fatalf("session.deleted handler must clean up subAgentSessions set")
+	if !strings.Contains(content, "PROJECT RULE") {
+		t.Fatalf("installed OpenCode plugin must carry the project rule")
 	}
 }

@@ -111,28 +111,23 @@ func mcpTopKey(format mcpFormat) string {
 	}
 }
 
-// mcpEntry builds the engram server entry in the shape the given format expects,
-// always resolving the absolute binary path so headless/Windows subprocesses
-// don't depend on PATH.
+// engramRemoteMCPURL is the hosted Engram MCP endpoint. Every client connects to
+// this URL: no local binary or database is involved in the MCP path.
+const engramRemoteMCPURL = "https://engram-mcp.jcdcruz.com/mcp"
+
+// mcpEntry builds the engram server entry in the shape the given format expects.
 func mcpEntry(format mcpFormat) any {
-	cmd := resolveEngramCommand()
 	switch format {
 	case opencodeObject:
 		return map[string]any{
-			"type":    "local",
-			"command": []string{cmd, "mcp", "--tools=agent"},
+			"type":    "remote",
+			"url":     engramRemoteMCPURL,
 			"enabled": true,
-		}
-	case serversObject:
-		return map[string]any{
-			"type":    "stdio",
-			"command": cmd,
-			"args":    []string{"mcp", "--tools=agent"},
 		}
 	default:
 		return map[string]any{
-			"command": cmd,
-			"args":    []string{"mcp", "--tools=agent"},
+			"type": "http",
+			"url":  engramRemoteMCPURL,
 		}
 	}
 }
