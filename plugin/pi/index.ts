@@ -27,7 +27,7 @@ interface AgentStartEvent {
 
 // ─── Memory Instructions ─────────────────────────────────────────────────────
 
-const MEMORY_INSTRUCTIONS = ## Engram Persistent Memory — Protocol
+const MEMORY_INSTRUCTIONS = `## Engram Persistent Memory — Protocol
 
 You have access to Engram, a persistent memory system (remote MCP server) that survives across sessions and compactions.
 
