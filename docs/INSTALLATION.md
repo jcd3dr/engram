@@ -2,7 +2,6 @@
 
 # Installation
 
-- [Homebrew (macOS / Linux)](#homebrew-macos--linux)
 - [Windows](#windows)
 - [Install from source (macOS / Linux)](#install-from-source-macos--linux)
 - [Download binary (all platforms)](#download-binary-all-platforms)
@@ -12,24 +11,9 @@
 
 ---
 
-## Homebrew (macOS / Linux)
+## Homebrew
 
-```bash
-brew install gentleman-programming/tap/engram
-```
-
-Upgrade to latest:
-
-```bash
-brew update && brew upgrade engram
-```
-
-> **Migrating from Cask?** If you installed engram before v1.0.1, it was distributed as a Cask. Uninstall first, then reinstall:
-> ```bash
-> brew uninstall --cask engram 2>/dev/null; brew install gentleman-programming/tap/engram
-> ```
-
-> **Keep `engram serve` running across `brew upgrade`?** On macOS, `brew upgrade engram` replaces the binary and kills any running `engram serve` process — autosync stops silently until you relaunch it. To make autosync survive upgrades and reboots, use the launchd template in [Running as a Service → Using launchd (macOS)](../DOCS.md#using-launchd-macos). Run `engram cloud status` afterwards: the `Local daemon:` line should report `running`.
+Not published for this fork. The Homebrew tap `gentleman-programming/tap` belongs to upstream and installs upstream's binary. Use the release binary below.
 
 ---
 
@@ -165,7 +149,7 @@ Grab the latest release for your platform from [GitHub Releases](https://github.
 
 ## Requirements
 
-- **Go 1.24+** to build from source (not needed if installing via Homebrew or downloading a binary)
+- **Go 1.24+** to build from source (not needed if downloading a release binary)
 - That's it. No runtime dependencies.
 
 The binary includes SQLite (via [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) — pure Go, no CGO). Works natively on **macOS**, **Linux**, and **Windows** (x86_64 and ARM64).

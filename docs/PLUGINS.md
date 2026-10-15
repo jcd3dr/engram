@@ -63,7 +63,7 @@ For [Claude Code](https://docs.anthropic.com/en/docs/claude-code) users, a plugi
 claude plugin marketplace add jcd3dr/engram
 claude plugin install engram
 
-# Or via engram binary (works from Homebrew or binary install)
+# Or via the engram release binary (configures the hosted MCP server)
 engram setup claude-code
 
 # Or for local development/testing from the repo

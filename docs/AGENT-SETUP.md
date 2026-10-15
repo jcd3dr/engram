@@ -203,7 +203,7 @@ Alternatives: `cd` into the target repo before starting the MCP server, or add r
 
 ## OpenCode
 
-> **Prerequisite**: Install the `engram` binary first (via [Homebrew](INSTALLATION.md#homebrew-macos--linux), [Windows binary](INSTALLATION.md#windows), [binary download](INSTALLATION.md#download-binary-all-platforms), or [source](INSTALLATION.md#install-from-source-macos--linux)). The plugin needs it for the MCP server and session tracking.
+> **Prerequisite**: Install the `engram` binary first (via [binary download](INSTALLATION.md#download-binary-all-platforms) or [source](INSTALLATION.md#install-from-source-macos--linux)). The MCP server is hosted, so the binary is only needed for `engram setup`.
 
 **Recommended: Full setup with one command** — installs the plugin AND registers the MCP server in `opencode.json` automatically:
 
@@ -247,7 +247,7 @@ See [Plugins → OpenCode Plugin](PLUGINS.md#opencode-plugin) for details on wha
 
 ## Claude Code
 
-> **Prerequisite**: Install the `engram` binary first (via [Homebrew](INSTALLATION.md#homebrew-macos--linux), [Windows binary](INSTALLATION.md#windows), [binary download](INSTALLATION.md#download-binary-all-platforms), or [source](INSTALLATION.md#install-from-source-macos--linux)). The plugin needs it for the MCP server and session tracking scripts.
+> **Prerequisite**: Install the `engram` binary first (via [binary download](INSTALLATION.md#download-binary-all-platforms) or [source](INSTALLATION.md#install-from-source-macos--linux)). The MCP server is hosted, so the binary is only needed for `engram setup`.
 
 **Option A: Plugin via marketplace (recommended)** — full session management, auto-import, compaction recovery, and Memory Protocol skill:
 

@@ -52,9 +52,7 @@ SQLite + FTS5 (~/.engram/engram.db)
 
 ### Install
 
-```bash
-brew install gentleman-programming/tap/engram
-```
+Download the `engram` binary for your platform from [GitHub Releases](https://github.com/jcd3dr/engram/releases/latest), or install only the client plugin (see below). The MCP server is hosted; no local database is needed.
 
 Windows, Linux, and other install methods → [docs/INSTALLATION.md](docs/INSTALLATION.md)
 
@@ -96,7 +94,7 @@ No Node.js, no Python, no Docker. **One binary, one SQLite file.**
 
 ### Pi Package
 
-Engram has a first-class Pi package: [`gentle-engram`](plugin/pi/README.md).
+Engram has a first-class Pi package from this repository: `pi install git:github.com/jcd3dr/engram` ([plugin/pi/README.md](plugin/pi/README.md)).
 
 ```bash
 engram setup pi
