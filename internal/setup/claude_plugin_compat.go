@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -192,4 +193,30 @@ func parseClaudeCodePluginVersion(version string) ([3]int, bool, bool) {
 		values[i] = value
 	}
 	return values, hasPrerelease, true
+}
+
+func validSemverIdentifiers(value string, rejectLeadingZeroNumbers bool) bool {
+	for _, identifier := range strings.Split(value, ".") {
+		if identifier == "" || (rejectLeadingZeroNumbers && len(identifier) > 1 && identifier[0] == '0' && validSemverNumber(identifier)) {
+			return false
+		}
+		for _, char := range identifier {
+			if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validSemverNumber(value string) bool {
+	if value == "" || (len(value) > 1 && value[0] == '0') {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
