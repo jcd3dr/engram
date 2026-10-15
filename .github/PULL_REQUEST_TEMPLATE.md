@@ -70,6 +70,7 @@ These run automatically and **all must pass** before merge:
 | **Check PR Has type:\* Label** | PR has exactly one `type:*` label | ⏳ |
 | **Unit Tests** | `go test ./...` passes | ⏳ |
 | **E2E Tests** | `go test -tags e2e ./internal/server/...` passes | ⏳ |
+| **DARS Gate** | Required DARS baseline files exist and version markers agree | ⏳ |
 
 ---
 
@@ -82,6 +83,33 @@ These run automatically and **all must pass** before merge:
 - [ ] Docs updated (if behavior changed)
 - [ ] Commits follow [conventional commits](https://www.conventionalcommits.org/) format
 - [ ] No `Co-Authored-By` trailers in commits
+
+---
+
+## 🧭 DARS pull request review
+
+This PR description records the DARS review already required by the repository's `AGENTS.md` and governance rules. It does not replace those authorities and does not decide semantic impact mechanically.
+
+### DARS validation
+
+- [ ] The change was reviewed for durable DARS impact before opening this PR.
+- [ ] Existing repository instructions/documentation touched by this change were preserved or reconciled rather than overwritten blindly.
+
+### Durable impact declaration
+
+Check every category that materially changed and name/link the responsible artifact.
+
+- [ ] Product/system purpose, scope, capability, requirement, contract, or durable behavior changed → `docs/SPEC.md` maintained.
+- [ ] Repository structure, relationships, ownership, or navigation changed → `docs/REPO_MAP.md` maintained.
+- [ ] Current operational state, blocker, active work, or pending work changed → `docs/PLAN.md` maintained.
+- [ ] An engineering convention changed or a new engineering concern was introduced → `docs/CONVENTIONS.md` maintained.
+- [ ] A significant durable decision was accepted or superseded → relevant ADR created/updated; history preserved.
+- [ ] Durable empirical evidence was produced or changed → `docs/evidence/*` maintained.
+- [ ] Repository-wide or agent-specific instructions changed → `AGENTS.md` and native agent surfaces reconciled.
+- [ ] Published or user-visible behavior changed → `CHANGELOG.md` maintained.
+- [ ] None of the above changed → no unrelated DARS documentary update was required.
+
+<!-- Briefly state what was checked, which DARS artifacts changed (if any), and any relevant evidence or rationale. -->
 
 ---
 
