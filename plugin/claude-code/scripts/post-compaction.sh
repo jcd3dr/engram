@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Engram (remote) — compaction recovery hook for Claude Code.
 set -u
 INPUT=$(cat)

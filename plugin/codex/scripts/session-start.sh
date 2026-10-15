@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Engram (remote) — SessionStart hook for Claude Code.
 # Talks to no local server and no local database. Derives the project name
 # from the working directory and tells the agent to pass it on every mem_* call.
