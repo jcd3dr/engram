@@ -7,8 +7,8 @@
   "author": {
     "name": "Gentleman Programming"
   },
-  "homepage": "https://github.com/Gentleman-Programming/engram",
-  "repository": "https://github.com/Gentleman-Programming/engram",
+  "homepage": "https://github.com/jcd3dr/engram",
+  "repository": "https://github.com/jcd3dr/engram",
   "license": "MIT",
   "category": "Productivity",
   "keywords": ["memory", "persistence", "sessions", "context"],

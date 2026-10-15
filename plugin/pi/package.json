@@ -5,10 +5,10 @@
   "type": "module",
   "license": "MIT",
   "author": "Gentleman Programming",
-  "homepage": "https://github.com/Gentleman-Programming/engram",
+  "homepage": "https://github.com/jcd3dr/engram",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Gentleman-Programming/engram.git",
+    "url": "git+https://github.com/jcd3dr/engram.git",
     "directory": "plugin/pi"
   },
   "bin": {
@@ -34,7 +34,7 @@
     "extension"
   ],
   "pi": {
-    "image": "https://raw.githubusercontent.com/Gentleman-Programming/engram/main/plugin/pi/assets/engram-logo-only.png",
+    "image": "https://raw.githubusercontent.com/jcd3dr/engram/main/plugin/pi/assets/engram-logo-only.png",
     "extensions": [
       "./index.ts"
     ]

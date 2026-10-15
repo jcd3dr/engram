@@ -76,8 +76,8 @@ type Result struct {
 	TUIPluginEnabled bool
 }
 
-const claudeCodeMarketplace = "Gentleman-Programming/engram"
-const codexMarketplace = "Gentleman-Programming/engram"
+const claudeCodeMarketplace = "jcd3dr/engram"
+const codexMarketplace = "jcd3dr/engram"
 
 const openCodeSubagentStatuslinePlugin = "opencode-subagent-statusline"
 

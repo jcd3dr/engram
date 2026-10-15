@@ -40,7 +40,8 @@ brew update && brew upgrade engram
 If you have Go installed, this is the cleanest and most trustworthy path — the binary is compiled on your machine from source, so no antivirus will flag it:
 
 ```powershell
-go install github.com/Gentleman-Programming/engram/cmd/engram@latest
+# go install is not available for this fork: the Go module path is still github.com/Gentleman-Programming/engram.
+# Use the release binary from https://github.com/jcd3dr/engram/releases instead.
 # Binary goes to %GOPATH%\bin\engram.exe (typically %USERPROFILE%\go\bin\)
 ```
 
@@ -49,7 +50,7 @@ Ensure `%GOPATH%\bin` (or `%USERPROFILE%\go\bin`) is on your `PATH`.
 **Option B: Build from source**
 
 ```powershell
-git clone https://github.com/Gentleman-Programming/engram.git
+git clone https://github.com/jcd3dr/engram.git
 cd engram
 go install ./cmd/engram
 # Binary goes to %GOPATH%\bin\engram.exe (typically %USERPROFILE%\go\bin\)
@@ -78,7 +79,7 @@ go install ./cmd/engram
 
 **Option C: Download the prebuilt binary**
 
-1. Go to [GitHub Releases](https://github.com/Gentleman-Programming/engram/releases)
+1. Go to [GitHub Releases](https://github.com/jcd3dr/engram/releases)
 2. Download `engram_<version>_windows_amd64.zip` (or `arm64` for ARM devices)
 3. Extract `engram.exe` to a folder in your `PATH` (e.g. `C:\Users\<you>\bin\`)
 
@@ -120,7 +121,7 @@ Expand-Archive engram_*_windows_amd64.zip -DestinationPath "$env:USERPROFILE\bin
 ## Install from source (macOS / Linux)
 
 ```bash
-git clone https://github.com/Gentleman-Programming/engram.git
+git clone https://github.com/jcd3dr/engram.git
 cd engram
 go install ./cmd/engram
 # Binary goes to $GOPATH/bin (typically ~/go/bin/)
@@ -149,7 +150,7 @@ go install ./cmd/engram
 
 ## Download binary (all platforms)
 
-Grab the latest release for your platform from [GitHub Releases](https://github.com/Gentleman-Programming/engram/releases).
+Grab the latest release for your platform from [GitHub Releases](https://github.com/jcd3dr/engram/releases).
 
 | Platform | File |
 |----------|------|

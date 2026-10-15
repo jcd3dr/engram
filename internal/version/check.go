@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	repoOwner = "Gentleman-Programming"
+	repoOwner = "jcd3dr"
 	repoName  = "engram"
 )
 
@@ -152,9 +152,9 @@ func updateInstructions() string {
 	case "darwin":
 		return "  brew update && brew upgrade engram"
 	case "linux":
-		return "  brew update && brew upgrade engram\n  or: go install github.com/Gentleman-Programming/engram/cmd/engram@latest"
+		return "  download the latest release: https://github.com/jcd3dr/engram/releases/latest"
 	default:
-		return "  go install github.com/Gentleman-Programming/engram/cmd/engram@latest\n  or: https://github.com/Gentleman-Programming/engram/releases/latest"
+		return "  download the latest release: https://github.com/jcd3dr/engram/releases/latest"
 	}
 }
 
